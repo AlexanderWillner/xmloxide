@@ -331,6 +331,11 @@ pub struct ComplexType {
     attributes: Vec<XsdAttribute>,
     /// Whether the type allows mixed content (text interspersed with elements).
     mixed: bool,
+    /// Base type name from `<xs:complexContent><xs:extension base="...">`.
+    ///
+    /// When set, the base type's content model particles must appear before
+    /// this type's own particles during validation.
+    extension_base: Option<String>,
 }
 
 /// The content model of a complex type.
@@ -499,6 +504,9 @@ pub fn parse_xsd_with_options(
 
     // Build substitution group index from all element declarations.
     build_substitution_index(&mut schema);
+
+    // Merge complexContent extension base content models.
+    merge_extension_bases(&mut schema);
 
     Ok(schema)
 }
@@ -834,6 +842,113 @@ fn build_substitution_index(schema: &mut XsdSchema) {
     }
 }
 
+/// Merges base-type content models into derived types via `complexContent/extension`.
+///
+/// XSD 1.0 section 3.4.2: when a complex type is derived by extension,
+/// the effective content model is the base type's particles followed by
+/// the extension's own particles, forming a single sequence.
+///
+/// This must run after all schemas are loaded so base types from imported
+/// namespaces are available.
+fn merge_extension_bases(schema: &mut XsdSchema) {
+    // Collect (type_name, base_type_name) pairs first to avoid borrow issues.
+    let extensions: Vec<(String, String)> = schema
+        .types
+        .iter()
+        .filter_map(|(name, ty)| {
+            if let XsdType::Complex(ct) = ty {
+                ct.extension_base.as_ref().map(|base| (name.clone(), base.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for (type_name, base_name) in extensions {
+        let base_particles = resolve_base_particles(&base_name, schema);
+        if base_particles.is_empty() {
+            continue;
+        }
+
+        // Merge: base particles first, then extension particles
+        if let Some(XsdType::Complex(ct)) = schema.types.get_mut(&type_name) {
+            match &mut ct.content {
+                ComplexContent::Sequence(ext_particles) => {
+                    let mut merged = base_particles;
+                    merged.append(ext_particles);
+                    *ext_particles = merged;
+                }
+                ComplexContent::Empty => {
+                    ct.content = ComplexContent::Sequence(base_particles);
+                }
+                ComplexContent::Choice(_) | ComplexContent::All(_) => {
+                    // Base particles before the choice/all group
+                    let mut merged = base_particles;
+                    let existing = ct.content.clone();
+                    merged.push(XsdParticle::Group(existing));
+                    ct.content = ComplexContent::Sequence(merged);
+                }
+                ComplexContent::SimpleContent { .. } => {
+                    // SimpleContent extension - no particle merging needed
+                }
+            }
+            ct.extension_base = None; // Merged, no longer needed
+        }
+    }
+}
+
+/// Resolves a type's content model particles, chasing extension chains.
+///
+/// Returns the effective particles for a type including all inherited
+/// base-type particles, in the correct XSD derivation order.
+fn resolve_base_particles(type_name: &str, schema: &XsdSchema) -> Vec<XsdParticle> {
+    resolve_base_particles_impl(type_name, schema, &mut HashSet::new())
+}
+
+fn resolve_base_particles_impl(
+    type_name: &str,
+    schema: &XsdSchema,
+    visited: &mut HashSet<String>,
+) -> Vec<XsdParticle> {
+    // Resolve QName prefix (e.g., "adv:AA_ObjektType" → "AA_ObjektType")
+    let local_name = if let Some((_, l)) = type_name.split_once(':') {
+        l
+    } else {
+        type_name
+    };
+
+    if !visited.insert(local_name.to_string()) {
+        return Vec::new(); // Cycle detected, stop
+    }
+
+    let ct = match schema.types.get(local_name) {
+        Some(XsdType::Complex(ct)) => ct,
+        _ => return Vec::new(),
+    };
+
+    // Recursively resolve base type particles first
+    let mut particles = if let Some(ref base) = ct.extension_base {
+        resolve_base_particles_impl(base, schema, visited)
+    } else {
+        Vec::new()
+    };
+
+    // Then append this type's own particles
+    match &ct.content {
+        ComplexContent::Sequence(p) => particles.extend(p.iter().cloned()),
+        ComplexContent::Empty => {}
+        ComplexContent::Choice(p) => {
+            particles.push(XsdParticle::Group(ComplexContent::Choice(p.clone())))
+        }
+        ComplexContent::All(p) => {
+            particles.push(XsdParticle::Group(ComplexContent::All(p.clone())))
+        }
+        ComplexContent::SimpleContent { .. } => {}
+    }
+
+    particles
+}
+
 /// Registers all supported built-in XSD types in the schema.
 fn register_builtin_types(schema: &mut XsdSchema) {
     let builtins = [
@@ -960,6 +1075,7 @@ fn parse_complex_type(doc: &Document, node: NodeId) -> ComplexType {
     let mixed = doc.attribute(node, "mixed") == Some("true");
     let mut content = ComplexContent::Empty;
     let mut attributes = Vec::new();
+    let mut extension_base: Option<String> = None;
 
     for child in doc.children(node) {
         let Some(child_name) = doc.node_name(child) else {
@@ -978,6 +1094,12 @@ fn parse_complex_type(doc: &Document, node: NodeId) -> ComplexType {
                 content = parse_simple_content(doc, child);
                 collect_simple_content_attributes(doc, child, &mut attributes);
             }
+            "complexContent" => {
+                let (base, ct, ext_attrs) = parse_complex_content(doc, child);
+                extension_base = base;
+                content = ct;
+                attributes.extend(ext_attrs);
+            }
             _ => {}
         }
     }
@@ -986,7 +1108,84 @@ fn parse_complex_type(doc: &Document, node: NodeId) -> ComplexType {
         content,
         attributes,
         mixed,
+        extension_base,
     }
+}
+
+/// Parses `<xs:complexContent><xs:extension base="...">`.
+///
+/// Returns `(base_type_name, content_model, extra_attributes)`.
+/// The content model contains only the extension's own particles;
+/// base-type merging is done in [`merge_extension_bases`].
+fn parse_complex_content(
+    doc: &Document,
+    cc_node: NodeId,
+) -> (Option<String>, ComplexContent, Vec<XsdAttribute>) {
+    let mut base = None;
+    let mut content = ComplexContent::Empty;
+    let mut attributes = Vec::new();
+
+    for cc_child in doc.children(cc_node) {
+        let Some(cc_name) = doc.node_name(cc_child) else { continue };
+        match cc_name {
+            "extension" => {
+                base = doc.attribute(cc_child, "base").map(String::from);
+                for ext_child in doc.children(cc_child) {
+                    let Some(ext_name) = doc.node_name(ext_child) else { continue };
+                    match ext_name {
+                        "sequence" => {
+                            content =
+                                parse_compositor(doc, ext_child, CompositorKind::Sequence)
+                        }
+                        "choice" => {
+                            content =
+                                parse_compositor(doc, ext_child, CompositorKind::Choice)
+                        }
+                        "all" => {
+                            content = parse_compositor(doc, ext_child, CompositorKind::All)
+                        }
+                        "attribute" => {
+                            if let Some(attr) = parse_attribute_decl(doc, ext_child) {
+                                attributes.push(attr);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "restriction" => {
+                // restriction replaces the base content model entirely
+                base = doc.attribute(cc_child, "base").map(String::from);
+                for restr_child in doc.children(cc_child) {
+                    let Some(restr_name) = doc.node_name(restr_child) else { continue };
+                    match restr_name {
+                        "sequence" => {
+                            content =
+                                parse_compositor(doc, restr_child, CompositorKind::Sequence)
+                        }
+                        "choice" => {
+                            content =
+                                parse_compositor(doc, restr_child, CompositorKind::Choice)
+                        }
+                        "all" => {
+                            content =
+                                parse_compositor(doc, restr_child, CompositorKind::All)
+                        }
+                        "attribute" => {
+                            if let Some(attr) = parse_attribute_decl(doc, restr_child) {
+                                attributes.push(attr);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                // Restriction replaces the base content model, so no extension_base
+                return (None, content, attributes);
+            }
+            _ => {}
+        }
+    }
+    (base, content, attributes)
 }
 
 /// Collects attribute declarations from `<xs:simpleContent>` extension children.
@@ -3932,5 +4131,106 @@ mod tests {
         let doc = Document::parse_str(r#"<root><unknown>oops</unknown></root>"#).unwrap();
         let result = validate_xsd(&doc, &schema);
         assert!(!result.is_valid, "non-member should be rejected");
+    }
+
+    #[test]
+    fn test_complex_content_extension_simple() {
+        let schema = parse_xsd(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root" type="DerivedType"/>
+                <xs:complexType name="BaseType">
+                    <xs:sequence>
+                        <xs:element name="a" type="xs:string"/>
+                        <xs:element name="b" type="xs:string"/>
+                    </xs:sequence>
+                </xs:complexType>
+                <xs:complexType name="DerivedType">
+                    <xs:complexContent>
+                        <xs:extension base="BaseType">
+                            <xs:sequence>
+                                <xs:element name="c" type="xs:string"/>
+                            </xs:sequence>
+                        </xs:extension>
+                    </xs:complexContent>
+                </xs:complexType>
+            </xs:schema>"#,
+        )
+        .unwrap();
+
+        // Correct order: a, b (base), then c (extension)
+        let doc = Document::parse_str("<root><a>1</a><b>2</b><c>3</c></root>").unwrap();
+        let result = validate_xsd(&doc, &schema);
+        assert!(result.is_valid, "correct order, errors: {:?}", result.errors);
+
+        // Wrong order: c before b
+        let doc = Document::parse_str("<root><a>1</a><c>3</c><b>2</b></root>").unwrap();
+        let result = validate_xsd(&doc, &schema);
+        assert!(!result.is_valid, "wrong order should be invalid");
+
+        // Missing base element
+        let doc = Document::parse_str("<root><c>3</c></root>").unwrap();
+        let result = validate_xsd(&doc, &schema);
+        assert!(!result.is_valid, "missing base element");
+    }
+
+    #[test]
+    fn test_complex_content_extension_chain() {
+        let schema = parse_xsd(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root" type="DerivedType"/>
+                <xs:complexType name="GrandBaseType">
+                    <xs:sequence>
+                        <xs:element name="a" type="xs:string"/>
+                    </xs:sequence>
+                </xs:complexType>
+                <xs:complexType name="BaseType">
+                    <xs:complexContent>
+                        <xs:extension base="GrandBaseType">
+                            <xs:sequence>
+                                <xs:element name="b" type="xs:string"/>
+                            </xs:sequence>
+                        </xs:extension>
+                    </xs:complexContent>
+                </xs:complexType>
+                <xs:complexType name="DerivedType">
+                    <xs:complexContent>
+                        <xs:extension base="BaseType">
+                            <xs:sequence>
+                                <xs:element name="c" type="xs:string"/>
+                            </xs:sequence>
+                        </xs:extension>
+                    </xs:complexContent>
+                </xs:complexType>
+            </xs:schema>"#,
+        )
+        .unwrap();
+
+        let doc = Document::parse_str("<root><a>1</a><b>2</b><c>3</c></root>").unwrap();
+        let result = validate_xsd(&doc, &schema);
+        assert!(result.is_valid, "3-level chain, errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn test_complex_content_extension_empty_base() {
+        let schema = parse_xsd(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root" type="DerivedType"/>
+                <xs:complexType name="EmptyBaseType"/>
+                <xs:complexType name="DerivedType">
+                    <xs:complexContent>
+                        <xs:extension base="EmptyBaseType">
+                            <xs:sequence>
+                                <xs:element name="x" type="xs:string"/>
+                            </xs:sequence>
+                        </xs:extension>
+                    </xs:complexContent>
+                </xs:complexType>
+            </xs:schema>"#,
+        )
+        .unwrap();
+
+        let doc = Document::parse_str("<root><x>hello</x></root>").unwrap();
+        let result = validate_xsd(&doc, &schema);
+        assert!(result.is_valid, "empty base extension, errors: {:?}", result.errors);
     }
 }
