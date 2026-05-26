@@ -132,6 +132,14 @@ pub struct XsdSchema {
     ///
     /// See XSD 1.0 section 3.3.2.
     element_form_default: FormDefault,
+    /// Substitution group index: maps head element name to member element names.
+    ///
+    /// When element `AX_Flurstueck` declares `substitutionGroup="adv:AU_Flaechenobjekt"`,
+    /// the local name "AU_Flaechenobjekt" maps to ["AX_Flurstueck"].
+    /// Built after all element declarations are parsed.
+    ///
+    /// See XSD 1.0 section 3.3.6: Element Substitution Groups.
+    substitution_groups: HashMap<String, Vec<String>>,
 }
 
 /// Whether local elements/attributes must be namespace-qualified in instances.
@@ -181,6 +189,16 @@ pub struct XsdElement {
     min_occurs: u32,
     /// Maximum number of occurrences (default 1 for local elements).
     max_occurs: MaxOccurs,
+    /// The `substitutionGroup` attribute (QName of the head element).
+    ///
+    /// See XSD 1.0 section 3.3.6: when set, this element can appear anywhere
+    /// the head element is expected in a content model.
+    substitution_group: Option<String>,
+    /// Whether this element is abstract (`abstract="true"`).
+    ///
+    /// Abstract elements cannot appear directly in instance documents;
+    /// only their substitution group members can.
+    is_abstract: bool,
 }
 
 /// Maximum occurrence constraint for particles.
@@ -468,6 +486,7 @@ pub fn parse_xsd_with_options(
         imported_namespaces: HashMap::new(),
         prefix_map,
         element_form_default,
+        substitution_groups: HashMap::new(),
     };
 
     register_builtin_types(&mut schema);
@@ -477,6 +496,9 @@ pub fn parse_xsd_with_options(
     loaded.insert("<root>".to_string());
 
     parse_xsd_internal(schema_xml, options, &mut loaded, &mut schema)?;
+
+    // Build substitution group index from all element declarations.
+    build_substitution_index(&mut schema);
 
     Ok(schema)
 }
@@ -747,6 +769,7 @@ fn handle_import(
         imported_namespaces: HashMap::new(),
         prefix_map: build_prefix_map(&imported_doc, imported_root),
         element_form_default: imported_form_default,
+        substitution_groups: HashMap::new(),
     };
     register_builtin_types(&mut temp_schema);
     parse_top_level_declarations(
@@ -778,6 +801,37 @@ fn handle_import(
     schema.imported_namespaces.entry(ns_key).or_insert(imported);
 
     Ok(())
+}
+
+/// Builds the substitution group index from all element declarations.
+///
+/// After all schemas (including includes/imports) are parsed, this scans
+/// every `XsdElement` for a `substitution_group` attribute and populates
+/// `schema.substitution_groups` as a map from head local name to member names.
+fn build_substitution_index(schema: &mut XsdSchema) {
+    let sub_groups: Vec<(String, String)> = schema
+        .elements
+        .values()
+        .filter_map(|e| {
+            e.substitution_group.as_ref().map(|sg| {
+                // Extract local name from QName like "adv:AU_Flaechenobjekt"
+                let local = if let Some((_, l)) = sg.split_once(':') {
+                    l.to_string()
+                } else {
+                    sg.clone()
+                };
+                (local, e.name.clone())
+            })
+        })
+        .collect();
+
+    for (head, member) in sub_groups {
+        schema
+            .substitution_groups
+            .entry(head)
+            .or_default()
+            .push(member);
+    }
 }
 
 /// Registers all supported built-in XSD types in the schema.
@@ -859,12 +913,18 @@ fn parse_element_decl(doc: &Document, node: NodeId) -> Option<XsdElement> {
             element_ref: Some(ref_qname.to_string()),
             min_occurs,
             max_occurs,
+            substitution_group: None,
+            is_abstract: false,
         });
     }
 
     let name = doc.attribute(node, "name")?.to_string();
     let type_ref = doc.attribute(node, "type").map(strip_xs_prefix);
     let inline_type = find_inline_type(doc, node);
+    let substitution_group = doc.attribute(node, "substitutionGroup").map(String::from);
+    let is_abstract = doc
+        .attribute(node, "abstract")
+        .map_or(false, |v| v == "true" || v == "1");
     Some(XsdElement {
         name,
         type_ref,
@@ -872,6 +932,8 @@ fn parse_element_decl(doc: &Document, node: NodeId) -> Option<XsdElement> {
         element_ref: None,
         min_occurs,
         max_occurs,
+        substitution_group,
+        is_abstract,
     })
 }
 
@@ -1452,6 +1514,11 @@ fn element_matches_decl(
 ) -> bool {
     let child_name = doc.node_name(node).unwrap_or("");
     if child_name != decl.name {
+        // Check substitution groups: if the instance element is a member
+        // of the substitution group headed by `decl`, it is a valid substitute.
+        if is_substitution_member(child_name, decl, schema) {
+            return true;
+        }
         return false;
     }
     // Check namespace qualification
@@ -1462,6 +1529,30 @@ fn element_matches_decl(
         }
     }
     true
+}
+
+/// Checks whether `child_name` is a member of the substitution group
+/// headed by `decl` (directly or transitively).
+///
+/// XSD 1.0 section 3.3.6: if element B declares `substitutionGroup="A"`,
+/// then B can appear anywhere A is expected. This is transitive: if
+/// C declares `substitutionGroup="B"`, C can also substitute for A.
+fn is_substitution_member(child_name: &str, decl: &XsdElement, schema: &XsdSchema) -> bool {
+    // Direct members of the declaration's substitution group
+    if let Some(members) = schema.substitution_groups.get(&decl.name) {
+        if members.iter().any(|m| m == child_name) {
+            return true;
+        }
+        // Transitive: check if any member itself has substitution members
+        for member in members {
+            if let Some(member_decl) = schema.elements.get(member) {
+                if is_substitution_member(child_name, member_decl, schema) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn validate_sequence_element(
@@ -1483,7 +1574,17 @@ fn validate_sequence_element(
                 break;
             }
         }
-        validate_element(doc, child, decl, schema, errors);
+        // Resolve the actual element declaration for validation.
+        // When substitution groups are involved, the instance element may
+        // differ from the schema declaration; we need the instance element's
+        // own type for correct content validation.
+        let child_name = doc.node_name(child).unwrap_or("");
+        let effective_decl = if child_name != decl.name {
+            schema.elements.get(child_name).map(|d| d as &XsdElement).unwrap_or(decl)
+        } else {
+            decl
+        };
+        validate_element(doc, child, effective_decl, schema, errors);
         count += 1;
         consumed += 1;
     }
@@ -3727,5 +3828,109 @@ mod tests {
             "unqualified children should pass: {:?}",
             result.errors
         );
+    }
+
+    // ── Substitution group tests ──────────────────────────────────────────
+
+    /// Schema with a substitution group: `dog` and `cat` substitute for `pet`.
+    #[test]
+    fn test_substitution_group_direct_member() {
+        let schema = parse_xsd(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="pets" type="PetsType"/>
+                <xs:complexType name="PetsType">
+                    <xs:sequence>
+                        <xs:element ref="pet" maxOccurs="unbounded"/>
+                    </xs:sequence>
+                </xs:complexType>
+                <xs:element name="pet" type="xs:string" abstract="true"/>
+                <xs:element name="dog" substitutionGroup="pet" type="xs:string"/>
+                <xs:element name="cat" substitutionGroup="pet" type="xs:string"/>
+            </xs:schema>"#,
+        )
+        .unwrap();
+
+        // "dog" should be accepted where "pet" is expected
+        let doc = Document::parse_str(
+            r#"<pets><dog>Rex</dog><cat>Mimi</cat></pets>"#,
+        )
+        .unwrap();
+        let result = validate_xsd(&doc, &schema);
+        assert!(result.is_valid, "substitution members should be valid: {:?}", result.errors);
+    }
+
+    /// Schema with transitive substitution: `poodle → dog → pet`.
+    #[test]
+    fn test_substitution_group_transitive() {
+        let schema = parse_xsd(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="kennel" type="KennelType"/>
+                <xs:complexType name="KennelType">
+                    <xs:sequence>
+                        <xs:element ref="pet" maxOccurs="unbounded"/>
+                    </xs:sequence>
+                </xs:complexType>
+                <xs:element name="pet" type="xs:string" abstract="true"/>
+                <xs:element name="dog" substitutionGroup="pet" type="xs:string"/>
+                <xs:element name="poodle" substitutionGroup="dog" type="xs:string"/>
+            </xs:schema>"#,
+        )
+        .unwrap();
+
+        // "poodle" is a transitive substitute for "pet" (via "dog")
+        let doc = Document::parse_str(
+            r#"<kennel><poodle>Fifi</poodle></kennel>"#,
+        )
+        .unwrap();
+        let result = validate_xsd(&doc, &schema);
+        assert!(result.is_valid, "transitive substitution should be valid: {:?}", result.errors);
+    }
+
+    /// Verify substitution group index is built correctly.
+    #[test]
+    fn test_substitution_group_index_populated() {
+        let schema = parse_xsd(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root" type="RootType"/>
+                <xs:complexType name="RootType">
+                    <xs:sequence>
+                        <xs:element ref="base"/>
+                    </xs:sequence>
+                </xs:complexType>
+                <xs:element name="base" type="xs:string"/>
+                <xs:element name="derived1" substitutionGroup="base" type="xs:string"/>
+                <xs:element name="derived2" substitutionGroup="base" type="xs:string"/>
+            </xs:schema>"#,
+        )
+        .unwrap();
+
+        // "derived1" and "derived2" should both substitute for "base"
+        let doc1 = Document::parse_str(r#"<root><derived1>hello</derived1></root>"#).unwrap();
+        let doc2 = Document::parse_str(r#"<root><derived2>world</derived2></root>"#).unwrap();
+        assert!(validate_xsd(&doc1, &schema).is_valid);
+        assert!(validate_xsd(&doc2, &schema).is_valid);
+    }
+
+    /// Element not in the substitution group should still be rejected.
+    #[test]
+    fn test_non_member_rejected() {
+        let schema = parse_xsd(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root" type="RootType"/>
+                <xs:complexType name="RootType">
+                    <xs:sequence>
+                        <xs:element ref="base"/>
+                    </xs:sequence>
+                </xs:complexType>
+                <xs:element name="base" type="xs:string"/>
+                <xs:element name="derived" substitutionGroup="base" type="xs:string"/>
+            </xs:schema>"#,
+        )
+        .unwrap();
+
+        // "unknown" is NOT a substitution group member
+        let doc = Document::parse_str(r#"<root><unknown>oops</unknown></root>"#).unwrap();
+        let result = validate_xsd(&doc, &schema);
+        assert!(!result.is_valid, "non-member should be rejected");
     }
 }
