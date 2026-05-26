@@ -901,6 +901,21 @@ fn merge_extension_bases(schema: &mut XsdSchema) {
 ///
 /// Returns the effective particles for a type including all inherited
 /// base-type particles, in the correct XSD derivation order.
+/// Looks up a complex type by local name, checking local types and
+/// imported namespace types.
+fn find_complex_type<'a>(local_name: &str, schema: &'a XsdSchema) -> Option<&'a ComplexType> {
+    if let Some(XsdType::Complex(ct)) = schema.types.get(local_name) {
+        return Some(ct);
+    }
+    // Check imported namespaces
+    for imported in schema.imported_namespaces.values() {
+        if let Some(XsdType::Complex(ct)) = imported.types.get(local_name) {
+            return Some(ct);
+        }
+    }
+    None
+}
+
 fn resolve_base_particles(type_name: &str, schema: &XsdSchema) -> Vec<XsdParticle> {
     resolve_base_particles_impl(type_name, schema, &mut HashSet::new())
 }
@@ -921,8 +936,8 @@ fn resolve_base_particles_impl(
         return Vec::new(); // Cycle detected, stop
     }
 
-    let ct = match schema.types.get(local_name) {
-        Some(XsdType::Complex(ct)) => ct,
+    let ct = match find_complex_type(local_name, schema) {
+        Some(ct) => ct,
         _ => return Vec::new(),
     };
 
@@ -1558,10 +1573,18 @@ fn resolve_type_name<'a>(type_name: &str, schema: &'a XsdSchema) -> Option<&'a X
             // Built-in XSD type — look up by local name
             return schema.types.get(&local);
         }
+        // If the namespace is our own targetNamespace, look up locally
+        if schema.target_namespace.as_deref() == Some(ns_uri.as_str()) {
+            return schema.types.get(&local);
+        }
         // Check imported namespaces
         if let Some(imported) = schema.imported_namespaces.get(ns_uri) {
             return imported.types.get(&local);
         }
+    }
+    // Last resort: try local name without namespace
+    if schema.types.get(&local).is_some() {
+        return schema.types.get(&local);
     }
     None
 }
@@ -1574,9 +1597,13 @@ fn resolve_element_ref<'a>(ref_qname: &str, schema: &'a XsdSchema) -> Option<&'a
     if !ref_qname.contains(':') {
         return schema.elements.get(ref_qname);
     }
-    // Prefixed ref — resolve namespace and look up in imported elements
+    // Prefixed ref — resolve namespace and look up
     let (ns, local) = resolve_type_qname(ref_qname, &schema.prefix_map);
     if let Some(ref ns_uri) = ns {
+        // If the namespace is our own targetNamespace, look up locally
+        if schema.target_namespace.as_deref() == Some(ns_uri.as_str()) {
+            return schema.elements.get(&local);
+        }
         if let Some(imported) = schema.imported_namespaces.get(ns_uri) {
             return imported.elements.get(&local);
         }
@@ -4233,4 +4260,87 @@ mod tests {
         let result = validate_xsd(&doc, &schema);
         assert!(result.is_valid, "empty base extension, errors: {:?}", result.errors);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn test_complex_content_extension_with_target_namespace() {
+    let schema = parse_xsd(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                     xmlns:adv="http://adv.example.com"
+                     targetNamespace="http://adv.example.com"
+                     elementFormDefault="qualified">
+            <xs:element name="root" type="adv:DerivedType"/>
+            <xs:complexType name="BaseType">
+                <xs:sequence>
+                    <xs:element name="a" type="xs:string"/>
+                    <xs:element name="b" type="xs:string"/>
+                </xs:sequence>
+            </xs:complexType>
+            <xs:complexType name="DerivedType">
+                <xs:complexContent>
+                    <xs:extension base="adv:BaseType">
+                        <xs:sequence>
+                            <xs:element name="c" type="xs:string"/>
+                        </xs:sequence>
+                    </xs:extension>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#,
+    )
+    .unwrap();
+
+    // Correct order: a, b (base), c (extension)
+    let doc = Document::parse_str(
+        r#"<adv:root xmlns:adv="http://adv.example.com">
+            <adv:a>1</adv:a><adv:b>2</adv:b><adv:c>3</adv:c>
+        </adv:root>"#,
+    )
+    .unwrap();
+    let result = validate_xsd(&doc, &schema);
+    assert!(result.is_valid, "correct order, errors: {:?}", result.errors);
+
+    // Wrong order: b before a  
+    let doc = Document::parse_str(
+        r#"<adv:root xmlns:adv="http://adv.example.com">
+            <adv:b>2</adv:b><adv:a>1</adv:a><adv:c>3</adv:c>
+        </adv:root>"#,
+    )
+    .unwrap();
+    let result = validate_xsd(&doc, &schema);
+    assert!(!result.is_valid, "wrong order should be detected");
+}
+
+#[cfg(test)]
+#[test]
+fn test_sequence_optional_element_wrong_position() {
+    // Sequence: required, optional, required
+    // Instance has: optional, required, required (optional before its position)
+    let schema = parse_xsd(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                     xmlns:adv="http://adv.example.com"
+                     targetNamespace="http://adv.example.com"
+                     elementFormDefault="qualified">
+            <xs:element name="root" type="adv:TestType"/>
+            <xs:complexType name="TestType">
+                <xs:sequence>
+                    <xs:element name="required1" type="xs:string"/>
+                    <xs:element name="optional" type="xs:string" minOccurs="0"/>
+                    <xs:element name="required2" type="xs:string"/>
+                </xs:sequence>
+            </xs:complexType>
+        </xs:schema>"#,
+    )
+    .unwrap();
+
+    // Wrong: optional before required1
+    let doc = Document::parse_str(
+        r#"<adv:root xmlns:adv="http://adv.example.com">
+            <adv:optional>x</adv:optional><adv:required1>a</adv:required1><adv:required2>b</adv:required2>
+        </adv:root>"#,
+    )
+    .unwrap();
+    let result = validate_xsd(&doc, &schema);
+    eprintln!("Errors: {:?}", result.errors);
+    assert!(!result.is_valid, "optional before required should be invalid");
 }
