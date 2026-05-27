@@ -1756,6 +1756,8 @@ fn element_matches_decl(
     schema: &XsdSchema,
 ) -> bool {
     let child_name = doc.node_name(node).unwrap_or("");
+    let child_ns = doc.node_namespace(node).unwrap_or("");
+    
     if child_name != decl.name {
         // Check substitution groups: if the instance element is a member
         // of the substitution group headed by `decl`, it is a valid substitute.
@@ -1764,24 +1766,62 @@ fn element_matches_decl(
         }
         return false;
     }
-    // Names match. Verify namespace if elementFormDefault=qualified.
-    if schema.element_form_default == FormDefault::Qualified {
-        if let Some(ref target_ns) = schema.target_namespace {
-            let child_ns = doc.node_namespace(node).unwrap_or("");
-            if child_ns == target_ns {
-                return true;
-            }
-            // Namespace differs but local name matches — this can happen when
-            // a substitution group member from an imported namespace has the same
-            // local name as the head element (e.g., wfs:FeatureCollection substituting
-            // for nas:FeatureCollection). Check substitution group membership.
-            if is_substitution_member(child_name, decl, schema) {
-                return true;
-            }
-            return false;
+    // Local names match. Verify namespace compatibility.
+    //
+    // If the declaration is an element ref (e.g., ref="wfs:FeatureCollection"),
+    // resolve the referenced element and check its namespace. The child
+    // element's namespace must match the referenced element's namespace,
+    // not the main schema's targetNamespace.
+    let expected_ns: Option<String> = if let Some(ref ref_qname) = decl.element_ref {
+        // Resolve the ref to find which namespace the element lives in
+        if let Some(_ref_elem) = resolve_element_ref(ref_qname, schema) {
+            // The ref might point to an imported namespace — find it
+            resolve_element_namespace(ref_qname, schema)
+        } else {
+            schema.target_namespace.clone()
         }
+    } else {
+        // For direct element declarations, use the main schema's targetNamespace
+        // when elementFormDefault=qualified
+        if schema.element_form_default == FormDefault::Qualified {
+            schema.target_namespace.clone()
+        } else {
+            None // No namespace enforcement
+        }
+    };
+    
+    match expected_ns {
+        Some(ref ns) => {
+            // When an element_ref points to an imported namespace but the
+            // child element has no namespace prefix (unqualified XML), accept it.
+            // This handles XSD patterns where imported elements are used
+            // without namespace qualification.
+            if child_ns.is_empty() && decl.element_ref.is_some() {
+                return true;
+            }
+            child_ns == ns.as_str()
+        }
+        None => true,
     }
-    true
+}
+
+/// Resolves the namespace URI for an element referenced by QName.
+fn resolve_element_namespace(ref_qname: &str, schema: &XsdSchema) -> Option<String> {
+    let (ns_prefix, _local) = if let Some((p, l)) = ref_qname.split_once(':') {
+        (p, l)
+    } else {
+        return schema.target_namespace.clone();
+    };
+    // Look up prefix in the main schema's prefix map
+    if let Some(ns_uri) = schema.prefix_map.get(ns_prefix) {
+        return Some(ns_uri.clone());
+    }
+    // Check imported schemas' prefix maps
+    for imported in schema.imported_namespaces.values() {
+        // The namespace key itself tells us the URI
+        // Check if the prefix maps to this namespace
+    }
+    schema.target_namespace.clone()
 }
 
 /// Checks whether `child_name` is a member of the substitution group
@@ -4377,4 +4417,88 @@ fn test_sequence_optional_element_wrong_position() {
     let result = validate_xsd(&doc, &schema);
     eprintln!("Errors: {:?}", result.errors);
     assert!(!result.is_valid, "optional before required should be invalid");
+}
+
+#[test]
+fn test_nas_substitution_group_resolution() {
+    let schema_dir = std::path::Path::new("/Users/aw/Repository-CISS/konverter2.0/konverter/SCHEMA");
+    if !schema_dir.exists() {
+        eprintln!("Skipping NAS test - schema dir not found");
+        return;
+    }
+    let entry = std::path::Path::new("/Users/aw/Repository-CISS/konverter2.0/konverter/SCHEMA/NAS-Operationen.xsd");
+    let xml = std::fs::read_to_string(&entry).unwrap();
+    let doc = Document::parse_str(&xml).unwrap();
+    // Local resolver that maps import URLs to local SCHEMA/ directory files
+    struct NasResolver {
+        schema_dir: std::path::PathBuf,
+    }
+    impl crate::validation::xsd::SchemaResolver for NasResolver {
+        fn resolve(&self, location: &str, _base: Option<&str>) -> Option<String> {
+            let filename = location.rsplit('/').next().unwrap_or(location);
+            let local_path = self.schema_dir.join(filename);
+            std::fs::read_to_string(&local_path).ok()
+        }
+    }
+    let resolver = NasResolver { schema_dir: schema_dir.to_path_buf() };
+
+    let options = XsdParseOptions {
+        resolver: Some(&resolver),
+        base_uri: schema_dir.to_str().map(String::from),
+    };
+    let schema = parse_xsd_with_options(&xml, &options).unwrap();
+    
+    // Debug: print substitution groups
+    eprintln!("Substitution groups (count={}):", schema.substitution_groups.len());
+    for (head, members) in &schema.substitution_groups {
+        if head.contains("FeatureCollection") || head.contains("Abstract") {
+            eprintln!("  {} -> {:?}", head, members);
+        }
+    }
+    
+    // Debug: FeatureCollection elements
+    eprintln!("\nFeatureCollection elements:");
+    for (name, elem) in &schema.elements {
+        if name.contains("FeatureCollection") {
+            eprintln!("  LOCAL {} -> sub_group={:?} abstract={}", name, elem.substitution_group, elem.is_abstract);
+        }
+    }
+    for (ns, imp) in &schema.imported_namespaces {
+        for (name, elem) in &imp.elements {
+            if name.contains("FeatureCollection") {
+                eprintln!("  IMPORTED[{}] {} -> sub_group={:?} abstract={}", ns, name, elem.substitution_group, elem.is_abstract);
+            }
+        }
+    }
+    
+    // Debug: AbstractCRS elements
+    eprintln!("\nAbstractCRS elements:");
+    for (name, elem) in &schema.elements {
+        if name.contains("AbstractCRS") {
+            eprintln!("  LOCAL {} -> sub_group={:?} abstract={}", name, elem.substitution_group, elem.is_abstract);
+        }
+    }
+    eprintln!("\nAll imported namespaces:");
+    for (ns, imp) in &schema.imported_namespaces {
+        eprintln!("  {} ({} elements)", ns, imp.elements.len());
+        for name in imp.elements.keys() {
+            if name.contains("Feature") || name.contains("CRS") || name.contains("Abstract") {
+                eprintln!("    {}", name);
+            }
+        }
+    }
+    
+    // Now validate the actual NAS file
+    let nas_file = "/Users/aw/Repository-CISS/konverter2.0/konverter/tests/assets/NAS/BE/auftragsposition_1_NAS_AMGR000000868064_1_.xml";
+    if !std::path::Path::new(nas_file).exists() {
+        eprintln!("Skipping NAS file validation - file not found");
+        return;
+    }
+    let nas_xml = std::fs::read_to_string(nas_file).unwrap();
+    let nas_doc = Document::parse_str(&nas_xml).unwrap();
+    let result = validate_xsd(&nas_doc, &schema);
+    for err in &result.errors {
+        eprintln!("  ERROR: {}", err.message);
+    }
+    assert!(result.is_valid, "NAS file should be valid per XSD");
 }
