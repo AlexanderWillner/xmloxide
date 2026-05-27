@@ -868,8 +868,11 @@ fn build_substitution_index(schema: &mut XsdSchema) {
 /// This must run after all schemas are loaded so base types from imported
 /// namespaces are available.
 fn merge_extension_bases(schema: &mut XsdSchema) {
-    // Collect (type_name, base_type_name) pairs first to avoid borrow issues.
-    let extensions: Vec<(String, String)> = schema
+    // Collect ALL extensions (main + imported) first, then merge.
+    // This avoids borrow conflicts between mutable types and immutable schema.
+    
+    // Main schema extensions
+    let main_extensions: Vec<(String, String)> = schema
         .types
         .iter()
         .filter_map(|(name, ty)| {
@@ -881,36 +884,60 @@ fn merge_extension_bases(schema: &mut XsdSchema) {
         })
         .collect();
 
-    for (type_name, base_name) in extensions {
+    for (type_name, base_name) in main_extensions {
         let base_particles = resolve_base_particles(&base_name, schema);
-        if base_particles.is_empty() {
-            continue;
-        }
+        if base_particles.is_empty() { continue; }
+        merge_type_extension(&mut schema.types, &type_name, base_particles);
+    }
 
-        // Merge: base particles first, then extension particles
-        if let Some(XsdType::Complex(ct)) = schema.types.get_mut(&type_name) {
-            match &mut ct.content {
-                ComplexContent::Sequence(ext_particles) => {
-                    let mut merged = base_particles;
-                    merged.append(ext_particles);
-                    *ext_particles = merged;
+    // Imported namespace extensions
+    let imported_extensions: Vec<(String, String)> = schema
+        .imported_namespaces
+        .values()
+        .flat_map(|imp| {
+            imp.types.iter().filter_map(|(name, ty)| {
+                if let XsdType::Complex(ct) = ty {
+                    ct.extension_base.as_ref().map(|base| (name.clone(), base.clone()))
+                } else {
+                    None
                 }
-                ComplexContent::Empty => {
-                    ct.content = ComplexContent::Sequence(base_particles);
-                }
-                ComplexContent::Choice(_) | ComplexContent::All(_) => {
-                    // Base particles before the choice/all group
-                    let mut merged = base_particles;
-                    let existing = ct.content.clone();
-                    merged.push(XsdParticle::Group(existing));
-                    ct.content = ComplexContent::Sequence(merged);
-                }
-                ComplexContent::SimpleContent { .. } => {
-                    // SimpleContent extension - no particle merging needed
-                }
-            }
-            ct.extension_base = None; // Merged, no longer needed
+            })
+        })
+        .collect();
+
+    for (type_name, base_name) in imported_extensions {
+        let base_particles = resolve_base_particles(&base_name, schema);
+        if base_particles.is_empty() { continue; }
+        for imp in schema.imported_namespaces.values_mut() {
+            merge_type_extension(&mut imp.types, &type_name, base_particles.clone());
         }
+    }
+}
+
+fn merge_type_extension(
+    types: &mut HashMap<String, XsdType>,
+    type_name: &str,
+    base_particles: Vec<XsdParticle>,
+) {
+    if let Some(XsdType::Complex(ct)) = types.get_mut(type_name) {
+        match &mut ct.content {
+            ComplexContent::Sequence(ext_particles) => {
+                let mut merged = base_particles;
+                merged.append(ext_particles);
+                *ext_particles = merged;
+            }
+            ComplexContent::Empty => {
+                ct.content = ComplexContent::Sequence(base_particles);
+            }
+            ComplexContent::Choice(_) | ComplexContent::All(_) => {
+                let mut merged = base_particles;
+                let existing = ct.content.clone();
+                merged.push(XsdParticle::Group(existing));
+                ct.content = ComplexContent::Sequence(merged);
+            }
+            ComplexContent::SimpleContent { .. } => {}
+        }
+        ct.extension_base = None;
     }
 }
 
@@ -1839,7 +1866,7 @@ fn element_matches_decl(
 ) -> bool {
     let child_name = doc.node_name(node).unwrap_or("");
     let child_ns = doc.node_namespace(node).unwrap_or("");
-    
+
     if child_name != decl.name {
         // Check substitution groups: if the instance element is a member
         // of the substitution group headed by `decl`, it is a valid substitute.
@@ -4564,6 +4591,39 @@ fn test_nas_substitution_group_resolution() {
     };
     let schema = parse_xsd_with_options(&xml, &options).unwrap();
     
+    // Debug: print FeatureCollectionType particles
+    if let Some(XsdType::Complex(ct)) = schema.types.get("FeatureCollectionType") {
+        eprintln!("\nFeatureCollectionType content:");
+        match &ct.content {
+            ComplexContent::Sequence(particles) => {
+                for p in particles {
+                    match p {
+                        XsdParticle::Element(e) => eprintln!("  element: name={} ref={:?}", e.name, e.element_ref),
+                        XsdParticle::Group(g) => eprintln!("  group: {:?}", g),
+                    }
+                }
+            }
+            other => eprintln!("  {:?}", other),
+        }
+    }
+    // Also check imported types
+    for (ns, imp) in &schema.imported_namespaces {
+        if let Some(XsdType::Complex(ct)) = imp.types.get("FeatureCollectionType") {
+            eprintln!("\nIMPORTED FeatureCollectionType [{}] content:", ns);
+            match &ct.content {
+                ComplexContent::Sequence(particles) => {
+                    for p in particles {
+                        match p {
+                            XsdParticle::Element(e) => eprintln!("  element: name={} ref={:?}", e.name, e.element_ref),
+                            XsdParticle::Group(g) => eprintln!("  group: {:?}", g),
+                        }
+                    }
+                }
+                other => eprintln!("  {:?}", other),
+            }
+        }
+    }
+
     // Debug: print substitution groups
     eprintln!("Substitution groups (count={}):", schema.substitution_groups.len());
     for (head, members) in &schema.substitution_groups {
