@@ -1785,6 +1785,19 @@ fn validate_complex_element(
 ) {
     let elem_name = doc.node_name(node).unwrap_or("<unknown>");
     validate_attributes(doc, node, &ct.attributes, schema, errors);
+
+    // GML reference property: if the element uses `xlink:href`, the content
+    // comes from the referenced resource, not inline. Skip content validation
+    // to allow `<foo xlink:href="..."/>` even when the XSD requires child
+    // elements (a standard GML/AAA pattern that libxml2 also accepts).
+    if doc
+        .attributes(node)
+        .iter()
+        .any(|a| a.name == "href" && a.namespace.as_deref() == Some("http://www.w3.org/1999/xlink"))
+    {
+        return;
+    }
+
     match &ct.content {
         ComplexContent::Empty => validate_empty_content(doc, node, elem_name, ct.mixed, errors),
         ComplexContent::Sequence(p) => {
