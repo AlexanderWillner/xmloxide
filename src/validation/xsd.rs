@@ -817,7 +817,8 @@ fn handle_import(
 /// every `XsdElement` for a `substitution_group` attribute and populates
 /// `schema.substitution_groups` as a map from head local name to member names.
 fn build_substitution_index(schema: &mut XsdSchema) {
-    let sub_groups: Vec<(String, String)> = schema
+    // Collect substitution group memberships from local elements
+    let mut sub_groups: Vec<(String, String)> = schema
         .elements
         .values()
         .filter_map(|e| {
@@ -832,6 +833,22 @@ fn build_substitution_index(schema: &mut XsdSchema) {
             })
         })
         .collect();
+
+    // Also scan imported schemas for substitution group memberships.
+    // Cross-namespace substitution groups (e.g., wfs:FeatureCollection
+    // substituting for nas:FeatureCollection) are only discoverable here.
+    for imported in schema.imported_namespaces.values() {
+        for e in imported.elements.values() {
+            if let Some(sg) = &e.substitution_group {
+                let local = if let Some((_, l)) = sg.split_once(':') {
+                    l.to_string()
+                } else {
+                    sg.clone()
+                };
+                sub_groups.push((local, e.name.clone()));
+            }
+        }
+    }
 
     for (head, member) in sub_groups {
         schema
@@ -1747,11 +1764,21 @@ fn element_matches_decl(
         }
         return false;
     }
-    // Check namespace qualification
+    // Names match. Verify namespace if elementFormDefault=qualified.
     if schema.element_form_default == FormDefault::Qualified {
         if let Some(ref target_ns) = schema.target_namespace {
             let child_ns = doc.node_namespace(node).unwrap_or("");
-            return child_ns == target_ns;
+            if child_ns == target_ns {
+                return true;
+            }
+            // Namespace differs but local name matches — this can happen when
+            // a substitution group member from an imported namespace has the same
+            // local name as the head element (e.g., wfs:FeatureCollection substituting
+            // for nas:FeatureCollection). Check substitution group membership.
+            if is_substitution_member(child_name, decl, schema) {
+                return true;
+            }
+            return false;
         }
     }
     true
@@ -1769,9 +1796,16 @@ fn is_substitution_member(child_name: &str, decl: &XsdElement, schema: &XsdSchem
         if members.iter().any(|m| m == child_name) {
             return true;
         }
-        // Transitive: check if any member itself has substitution members
+        // Transitive: check if any member itself has substitution members.
+        // Look up member declarations in both local and imported elements.
         for member in members {
-            if let Some(member_decl) = schema.elements.get(member) {
+            let member_decl = schema.elements.get(member).or_else(|| {
+                schema
+                    .imported_namespaces
+                    .values()
+                    .find_map(|imp| imp.elements.get(member))
+            });
+            if let Some(member_decl) = member_decl {
                 if is_substitution_member(child_name, member_decl, schema) {
                     return true;
                 }
