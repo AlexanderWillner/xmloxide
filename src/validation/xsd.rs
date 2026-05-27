@@ -1709,10 +1709,10 @@ fn validate_sequence(
     errors: &mut Vec<ValidationError>,
 ) {
     let mut idx = 0;
-    for particle in particles {
+    for (particle_idx, particle) in particles.iter().enumerate() {
         match particle {
             XsdParticle::Element(decl) => {
-                idx += validate_sequence_element(
+                let consumed = validate_sequence_element(
                     doc,
                     &children[idx..],
                     decl,
@@ -1720,9 +1720,32 @@ fn validate_sequence(
                     schema,
                     errors,
                 );
+                idx += consumed;
+
+                // If nothing was consumed and children remain, check if the
+                // child matches a later particle. If it does, this optional
+                // particle is simply skipped. If it doesn't match anything,
+                // it's out-of-order or unexpected.
+                if consumed == 0 && idx < children.len() {
+                    let child = children[idx];
+                    let matches_later = matches_later_particle(
+                        doc, child, &particles[particle_idx + 1..], schema,
+                    );
+                    if !matches_later {
+                        let child_name = doc.node_name(child).unwrap_or("<unknown>");
+                        errors.push(ValidationError {
+                            message: format!(
+                                "unexpected element <{child_name}> in <{parent_name}>; not expected by the content model at this position"
+                            ),
+                            line: None,
+                            column: None,
+                        });
+                        idx += 1; // Skip and continue
+                    }
+                }
             }
             XsdParticle::Group(content) => {
-                idx += validate_group_content(
+                let consumed = validate_group_content(
                     doc,
                     &children[idx..],
                     content,
@@ -1730,6 +1753,7 @@ fn validate_sequence(
                     schema,
                     errors,
                 );
+                idx += consumed;
             }
         }
     }
@@ -1739,6 +1763,64 @@ fn validate_sequence(
             message: format!("unexpected element <{unexpected}> in <{parent_name}>; not expected by the content model"),
             line: None, column: None,
         });
+    }
+}
+
+/// Checks if a child element matches any particle in later positions of a sequence.
+fn matches_later_particle(
+    doc: &Document,
+    child: NodeId,
+    later_particles: &[XsdParticle],
+    schema: &XsdSchema,
+) -> bool {
+    for particle in later_particles {
+        match particle {
+            XsdParticle::Element(decl) => {
+                if element_matches_decl(doc, child, decl, schema) {
+                    return true;
+                }
+            }
+            XsdParticle::Group(content) => {
+                if matches_later_group(doc, child, content, schema) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn matches_later_group(
+    doc: &Document,
+    child: NodeId,
+    content: &ComplexContent,
+    schema: &XsdSchema,
+) -> bool {
+    match content {
+        ComplexContent::Empty | ComplexContent::SimpleContent { .. } => false,
+        ComplexContent::Sequence(particles) => {
+            matches_later_particle(doc, child, particles, schema)
+        }
+        ComplexContent::Choice(particles) => {
+            for particle in particles {
+                match particle {
+                    XsdParticle::Element(decl) => {
+                        if element_matches_decl(doc, child, decl, schema) {
+                            return true;
+                        }
+                    }
+                    XsdParticle::Group(c) => {
+                        if matches_later_group(doc, child, c, schema) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
+        ComplexContent::All(particles) => {
+            matches_later_particle(doc, child, particles, schema)
+        }
     }
 }
 
@@ -4418,6 +4500,40 @@ fn test_sequence_optional_element_wrong_position() {
     eprintln!("Errors: {:?}", result.errors);
     assert!(!result.is_valid, "optional before required should be invalid");
 }
+
+    #[test]
+    fn test_sequence_order_violation() {
+        // Schema: sequence with optional element between two required ones
+        let schema = parse_xsd(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType><xs:sequence>
+                        <xs:element name="a" type="xs:string"/>
+                        <xs:element name="b" type="xs:string" minOccurs="0"/>
+                        <xs:element name="c" type="xs:string"/>
+                    </xs:sequence></xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        )
+        .unwrap();
+
+        // Valid: a, b, c in order
+        let doc_ok = Document::parse_str("<root><a>1</a><b>2</b><c>3</c></root>").unwrap();
+        let result_ok = validate_xsd(&doc_ok, &schema);
+        assert!(result_ok.is_valid, "a,b,c should be valid: {:?}", result_ok.errors);
+
+        // Valid: a, c (b optional, skipped)
+        let doc_ok2 = Document::parse_str("<root><a>1</a><c>3</c></root>").unwrap();
+        let result_ok2 = validate_xsd(&doc_ok2, &schema);
+        assert!(result_ok2.is_valid, "a,c should be valid (b optional): {:?}", result_ok2.errors);
+
+        // Invalid: c, a, b — c appears before a
+        let doc_bad = Document::parse_str("<root><c>3</c><a>1</a><b>2</b></root>").unwrap();
+        let result_bad = validate_xsd(&doc_bad, &schema);
+        assert!(!result_bad.is_valid, "c before a should be invalid");
+        assert!(result_bad.errors.iter().any(|e| e.message.contains("unexpected")),
+            "should report ordering error: {:?}", result_bad.errors);
+    }
 
 #[test]
 fn test_nas_substitution_group_resolution() {
