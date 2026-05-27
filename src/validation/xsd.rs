@@ -363,6 +363,43 @@ pub enum XsdParticle {
     Element(XsdElement),
     /// A nested compositor group (sequence, choice, or all).
     Group(ComplexContent),
+    /// An element wildcard (`<xsd:any>`).
+    Any(XsdAny),
+}
+
+/// Represents `<xsd:any>` element wildcard in a content model.
+#[derive(Debug, Clone)]
+pub struct XsdAny {
+    /// Namespace constraint: `##any`, `##other`, or list of namespace URIs.
+    pub namespace: XsdAnyNamespace,
+    /// Processing mode for matched elements.
+    pub process_contents: XsdProcessContents,
+    /// Minimum occurrences (default 1).
+    pub min_occurs: u32,
+    /// Maximum occurrences.
+    pub max_occurs: MaxOccurs,
+}
+
+/// Namespace constraint for `<xsd:any>`.
+#[derive(Debug, Clone)]
+pub enum XsdAnyNamespace {
+    /// `##any` — any namespace.
+    Any,
+    /// `##other` — any namespace except the targetNamespace.
+    Other,
+    /// Explicit list of namespace URIs.
+    List(Vec<String>),
+}
+
+/// Processing mode for `<xsd:any>` matched elements.
+#[derive(Debug, Clone)]
+pub enum XsdProcessContents {
+    /// `strict` — validate against schema declaration (default).
+    Strict,
+    /// `lax` — validate if declaration found, accept otherwise.
+    Lax,
+    /// `skip` — no validation.
+    Skip,
 }
 
 /// An attribute declaration.
@@ -1056,8 +1093,51 @@ fn register_builtin_types(schema: &mut XsdSchema) {
 ///
 /// Handles both named declarations (`name="foo" type="xs:string"`) and
 /// element references (`ref="cbc:ID"`). For references, the `ref` `QName`
-/// is stored in `element_ref` and the local name is used as the element
-/// name for matching.
+/// Parses an `<xs:any>` element wildcard declaration.
+fn parse_any_wildcard(doc: &Document, node: NodeId) -> Option<XsdAny> {
+    let namespace_str = doc.attribute(node, "namespace").unwrap_or("##any");
+    let namespace = match namespace_str {
+        "##any" => XsdAnyNamespace::Any,
+        "##other" => XsdAnyNamespace::Other,
+        other => XsdAnyNamespace::List(
+            other
+                .split_whitespace()
+                .map(String::from)
+                .collect(),
+        ),
+    };
+
+    let process_contents = match doc.attribute(node, "processContents").unwrap_or("") {
+        "strict" => XsdProcessContents::Strict,
+        "lax" => XsdProcessContents::Lax,
+        "skip" => XsdProcessContents::Skip,
+        _ => XsdProcessContents::Strict,
+    };
+
+    let min_occurs = doc
+        .attribute(node, "minOccurs")
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(1);
+    let max_occurs = doc
+        .attribute(node, "maxOccurs")
+        .map(|s| {
+            if s == "unbounded" {
+                MaxOccurs::Unbounded
+            } else {
+                MaxOccurs::Bounded(s.parse::<u32>().unwrap_or(1))
+            }
+        })
+        .unwrap_or(MaxOccurs::Bounded(1));
+
+    Some(XsdAny {
+        namespace,
+        process_contents,
+        min_occurs,
+        max_occurs,
+    })
+}
+
+/// Parses an `<xs:element>` declaration within a content model. Element refs
 fn parse_element_decl(doc: &Document, node: NodeId) -> Option<XsdElement> {
     let min_occurs = doc
         .attribute(node, "minOccurs")
@@ -1307,6 +1387,11 @@ fn parse_compositor(doc: &Document, node: NodeId, kind: CompositorKind) -> Compl
                     child,
                     CompositorKind::All,
                 )));
+            }
+            "any" => {
+                if let Some(any) = parse_any_wildcard(doc, child) {
+                    particles.push(XsdParticle::Any(any));
+                }
             }
             _ => {}
         }
@@ -1782,6 +1867,17 @@ fn validate_sequence(
                 );
                 idx += consumed;
             }
+            XsdParticle::Any(any) => {
+                let consumed = validate_any_wildcard(
+                    doc,
+                    &children[idx..],
+                    any,
+                    parent_name,
+                    schema,
+                    errors,
+                );
+                idx += consumed;
+            }
         }
     }
     if idx < children.len() {
@@ -1812,6 +1908,9 @@ fn matches_later_particle(
                     return true;
                 }
             }
+            XsdParticle::Any(_) => {
+                return true;
+            }
         }
     }
     false
@@ -1840,6 +1939,9 @@ fn matches_later_group(
                         if matches_later_group(doc, child, c, schema) {
                             return true;
                         }
+                    }
+                    XsdParticle::Any(_) => {
+                        return true;
                     }
                 }
             }
@@ -2037,6 +2139,74 @@ fn validate_group_content(
     }
 }
 
+/// Validates `<xsd:any>` wildcard: consumes child elements that match
+/// the namespace constraint.
+fn validate_any_wildcard(
+    doc: &Document,
+    children: &[NodeId],
+    any: &XsdAny,
+    parent_name: &str,
+    schema: &XsdSchema,
+    _errors: &mut Vec<ValidationError>,
+) -> usize {
+    let target_ns = schema.target_namespace.as_deref().unwrap_or("");
+    let mut count: u32 = 0;
+    let mut consumed = 0;
+
+    for &child in children {
+        let child_ns = doc.node_namespace(child).unwrap_or("");
+        let matches_ns = match &any.namespace {
+            XsdAnyNamespace::Any => true,
+            XsdAnyNamespace::Other => child_ns != target_ns,
+            XsdAnyNamespace::List(ns_list) => {
+                ns_list.iter().any(|ns| child_ns == ns.as_str())
+                    || (ns_list.iter().any(|ns| ns == "##targetNamespace" ) && child_ns == target_ns)
+                    || (ns_list.iter().any(|ns| ns == "##local" ) && child_ns.is_empty())
+            }
+        };
+
+        if !matches_ns {
+            break;
+        }
+
+        if let MaxOccurs::Bounded(max) = any.max_occurs {
+            if count >= max {
+                break;
+            }
+        }
+
+        // For lax/skip: just accept the element without validation
+        // For strict: we would need to resolve the element's type,
+        // but for now accept it (strict validation of xsd:any is
+        // complex and requires cross-schema element resolution)
+        match any.process_contents {
+            XsdProcessContents::Skip | XsdProcessContents::Lax => {
+                // Accept without validation
+            }
+            XsdProcessContents::Strict => {
+                // Try to find and validate the element declaration
+                // For now, accept (same as lax for cross-namespace elements)
+            }
+        }
+
+        count += 1;
+        consumed += 1;
+    }
+
+    if count < any.min_occurs {
+        _errors.push(ValidationError {
+            message: format!(
+                "element <{parent_name}> requires at least {} wildcard element(s), found {count}",
+                any.min_occurs
+            ),
+            line: None,
+            column: None,
+        });
+    }
+
+    consumed
+}
+
 /// Validates a choice content model.
 fn validate_choice(
     doc: &Document,
@@ -2061,13 +2231,20 @@ fn validate_choice(
     let first = children[0];
     let first_name = doc.node_name(first).unwrap_or("");
     let matched = particles.iter().any(|p| {
-        if let XsdParticle::Element(decl) = p {
-            if element_matches_decl(doc, first, decl, schema) {
-                validate_element(doc, first, decl, schema, errors);
-                return true;
+        match p {
+            XsdParticle::Element(decl) => {
+                if element_matches_decl(doc, first, decl, schema) {
+                    validate_element(doc, first, decl, schema, errors);
+                    return true;
+                }
+                false
             }
+            XsdParticle::Any(_) => {
+                // Wildcard matches any element — accept
+                true
+            }
+            _ => false,
         }
-        false
     });
     if !matched {
         let choices: Vec<&str> = particles
@@ -4600,6 +4777,7 @@ fn test_nas_substitution_group_resolution() {
                     match p {
                         XsdParticle::Element(e) => eprintln!("  element: name={} ref={:?}", e.name, e.element_ref),
                         XsdParticle::Group(g) => eprintln!("  group: {:?}", g),
+                        XsdParticle::Any(_) => eprintln!("  <any>"),
                     }
                 }
             }
@@ -4616,6 +4794,7 @@ fn test_nas_substitution_group_resolution() {
                         match p {
                             XsdParticle::Element(e) => eprintln!("  element: name={} ref={:?}", e.name, e.element_ref),
                             XsdParticle::Group(g) => eprintln!("  group: {:?}", g),
+                            XsdParticle::Any(_) => eprintln!("  <any>"),
                         }
                     }
                 }
