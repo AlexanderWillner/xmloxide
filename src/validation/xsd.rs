@@ -1671,6 +1671,8 @@ pub fn validate_xsd(doc: &Document, schema: &XsdSchema) -> ValidationResult {
     let root_name = doc.node_name(root).unwrap_or("");
     if let Some(decl) = schema.elements.get(root_name) {
         validate_element(doc, root, decl, schema, &mut errors);
+    } else if let Some(decl) = find_root_element_in_imports(root_name, schema) {
+        validate_element(doc, root, decl, schema, &mut errors);
     } else {
         errors.push(ValidationError {
             message: format!(
@@ -1685,6 +1687,23 @@ pub fn validate_xsd(doc: &Document, schema: &XsdSchema) -> ValidationResult {
         errors,
         warnings: vec![],
     }
+}
+
+/// Searches imported schemas for a global element declaration.
+///
+/// This handles cases where the root element is declared in an imported
+/// schema (e.g., `AX_Bestandsdatenauszug` in `NAS-Operationen.xsd`
+/// imported by `AAA-Basisschema.xsd`).
+fn find_root_element_in_imports<'a>(
+    root_name: &str,
+    schema: &'a XsdSchema,
+) -> Option<&'a XsdElement> {
+    for imported in schema.imported_namespaces.values() {
+        if let Some(decl) = imported.elements.get(root_name) {
+            return Some(decl);
+        }
+    }
+    None
 }
 
 /// Validates a single element against its declaration.
@@ -4917,4 +4936,89 @@ fn test_nas_substitution_group_resolution() {
         e.message.contains("requires at least 1 occurrence(s) of <FeatureCollection>") ||
         e.message.contains("unexpected element <FeatureCollection>")),
         "FeatureCollection substitution group should be resolved");
+}
+
+/// Test that root elements declared in imported schemas are found.
+///
+/// Tests that `validate_xsd` finds `AX_Bestandsdatenauszug` from
+/// `NAS-Operationen.xsd` (imported by `AAA-Basisschema.xsd`).
+#[test]
+fn test_root_element_from_imported_schema() {
+    let schema_dir = std::path::Path::new("/Users/aw/Repository-CISS/konverter2.0/konverter/SCHEMA");
+    let entry = schema_dir.join("AAA-Basisschema.xsd");
+    if !entry.exists() {
+        eprintln!("Skipping test - AAA-Basisschema.xsd not found");
+        return;
+    }
+    let xsd_str = std::fs::read_to_string(&entry).unwrap();
+    let resolver = |location: &str, _base: Option<&str>| -> Option<String> {
+        let filename = location.rsplit('/').next().unwrap_or(location);
+        std::fs::read_to_string(schema_dir.join(filename)).ok()
+    };
+    let options = XsdParseOptions {
+        resolver: Some(&resolver),
+        base_uri: Some(format!("file:///{}", entry.display())),
+    };
+    let schema = parse_xsd_with_options(&xsd_str, &options).unwrap();
+
+    // Minimal valid instance with correct element order
+    let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<AX_Bestandsdatenauszug
+  xmlns="http://www.adv-online.de/namespaces/adv/gid/7.1"
+  xmlns:gml="http://www.opengis.net/gml/3.2"
+  xmlns:wfs="http://www.opengis.net/wfs/2.0"
+  xmlns:xlink="http://www.w3.org/1999/xlink">
+  <erfolgreich>true</erfolgreich>
+  <antragsnummer>123</antragsnummer>
+  <allgemeineAngaben>
+    <AX_K_Benutzungsergebnis>
+      <erfolgreich>true</erfolgreich>
+    </AX_K_Benutzungsergebnis>
+  </allgemeineAngaben>
+  <koordinatenangaben>
+    <AA_Koordinatenreferenzsystemangaben>
+      <crs xlink:href="urn:adv:crs:ETRS89_UTM33"/>
+      <anzahlDerNachkommastellen>3</anzahlDerNachkommastellen>
+      <standard>true</standard>
+    </AA_Koordinatenreferenzsystemangaben>
+  </koordinatenangaben>
+  <enthaelt/>
+</AX_Bestandsdatenauszug>"#;
+    let doc = Document::parse_str(std::str::from_utf8(xml).unwrap()).unwrap();
+    let result = validate_xsd(&doc, &schema);
+
+    // Should NOT report "not declared as a global element"
+    // If this fails, root element lookup in imported schemas is broken.
+    assert!(!result.errors.iter().any(|e|
+        e.message.contains("not declared as a global element")),
+        "AX_Bestandsdatenauszug should be found: {:?}",
+        result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+
+    // Should detect ordering: erlaeuterung (from base) is optional and absent here,
+    // sequence is: erlaeuterung?, erfolgreich, antragsnummer, allgemeineAngaben, ...
+    // With wrong order (allgemeineAngaben before antragsnummer):
+    let xml_bad = br#"<?xml version="1.0" encoding="UTF-8"?>
+<AX_Bestandsdatenauszug
+  xmlns="http://www.adv-online.de/namespaces/adv/gid/7.1"
+  xmlns:gml="http://www.opengis.net/gml/3.2"
+  xmlns:xlink="http://www.w3.org/1999/xlink">
+  <allgemeineAngaben>
+    <AX_K_Benutzungsergebnis><erfolgreich>true</erfolgreich></AX_K_Benutzungsergebnis>
+  </allgemeineAngaben>
+  <antragsnummer>123</antragsnummer>
+  <erfolgreich>true</erfolgreich>
+  <koordinatenangaben>
+    <AA_Koordinatenreferenzsystemangaben>
+      <crs xlink:href="urn:adv:crs:ETRS89_UTM33"/>
+      <anzahlDerNachkommastellen>3</anzahlDerNachkommastellen>
+      <standard>true</standard>
+    </AA_Koordinatenreferenzsystemangaben>
+  </koordinatenangaben>
+  <enthaelt/>
+</AX_Bestandsdatenauszug>"#;
+    let doc_bad = Document::parse_str(std::str::from_utf8(xml_bad).unwrap()).unwrap();
+    let result_bad = validate_xsd(&doc_bad, &schema);
+    assert!(!result_bad.is_valid,
+        "wrong element order should be detected: {:?}", result_bad.errors);
 }
