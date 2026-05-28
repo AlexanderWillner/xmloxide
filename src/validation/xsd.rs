@@ -113,33 +113,19 @@ pub struct XsdSchema {
     /// The target namespace of the schema, if declared.
     pub target_namespace: Option<String>,
     /// Global element declarations, keyed by element name.
-    elements: HashMap<String, XsdElement>,
+    pub elements: HashMap<String, XsdElement>,
     /// Named type definitions (both simple and complex), keyed by type name.
-    types: HashMap<String, XsdType>,
+    pub types: HashMap<String, XsdType>,
     /// Named attribute groups, keyed by group name.
-    attribute_groups: HashMap<String, Vec<XsdAttribute>>,
+    pub attribute_groups: HashMap<String, Vec<XsdAttribute>>,
     /// Imported schemas from other namespaces, keyed by namespace URI.
-    imported_namespaces: HashMap<String, ImportedSchema>,
+    pub imported_namespaces: HashMap<String, ImportedSchema>,
     /// Prefix-to-namespace-URI map from the root schema element.
-    ///
-    /// Used during validation to resolve `QName` type references like
-    /// `tns:AddressType` to the correct namespace for imported type lookup.
-    prefix_map: HashMap<String, String>,
+    pub prefix_map: HashMap<String, String>,
     /// The `elementFormDefault` attribute from the schema root.
-    ///
-    /// When `Qualified`, local element declarations must be namespace-qualified
-    /// in instance documents. Default is `Unqualified`.
-    ///
-    /// See XSD 1.0 section 3.3.2.
-    element_form_default: FormDefault,
+    pub element_form_default: FormDefault,
     /// Substitution group index: maps head element name to member element names.
-    ///
-    /// When element `AX_Flurstueck` declares `substitutionGroup="adv:AU_Flaechenobjekt"`,
-    /// the local name "AU_Flaechenobjekt" maps to ["AX_Flurstueck"].
-    /// Built after all element declarations are parsed.
-    ///
-    /// See XSD 1.0 section 3.3.6: Element Substitution Groups.
-    substitution_groups: HashMap<String, Vec<String>>,
+    pub substitution_groups: HashMap<String, Vec<String>>,
 }
 
 /// Whether local elements/attributes must be namespace-qualified in instances.
@@ -157,13 +143,13 @@ pub enum FormDefault {
 ///
 /// See XSD 1.0 section 4.2.3.
 #[derive(Debug, Clone)]
-struct ImportedSchema {
+pub struct ImportedSchema {
     /// Global element declarations from the imported namespace.
-    elements: HashMap<String, XsdElement>,
+    pub elements: HashMap<String, XsdElement>,
     /// Named type definitions from the imported namespace.
-    types: HashMap<String, XsdType>,
+    pub types: HashMap<String, XsdType>,
     /// Named attribute groups from the imported namespace.
-    attribute_groups: HashMap<String, Vec<XsdAttribute>>,
+    pub attribute_groups: HashMap<String, Vec<XsdAttribute>>,
 }
 
 /// An element declaration in the schema.
@@ -175,30 +161,30 @@ struct ImportedSchema {
 #[derive(Debug, Clone)]
 pub struct XsdElement {
     /// The element name.
-    name: String,
+    pub name: String,
     /// Reference to a named type (e.g., `"xs:string"` or a user-defined name).
-    type_ref: Option<String>,
+    pub type_ref: Option<String>,
     /// An inline anonymous type definition.
-    inline_type: Option<XsdType>,
+    pub inline_type: Option<XsdType>,
     /// Reference to a global element declaration (`ref` attribute `QName`).
     ///
     /// When present, the element's type is resolved from the referenced
     /// global element declaration rather than from `type_ref` or `inline_type`.
-    element_ref: Option<String>,
+    pub element_ref: Option<String>,
     /// Minimum number of occurrences (default 1 for local elements).
-    min_occurs: u32,
+    pub min_occurs: u32,
     /// Maximum number of occurrences (default 1 for local elements).
-    max_occurs: MaxOccurs,
+    pub max_occurs: MaxOccurs,
     /// The `substitutionGroup` attribute (QName of the head element).
     ///
     /// See XSD 1.0 section 3.3.6: when set, this element can appear anywhere
     /// the head element is expected in a content model.
-    substitution_group: Option<String>,
+    pub substitution_group: Option<String>,
     /// Whether this element is abstract (`abstract="true"`).
     ///
     /// Abstract elements cannot appear directly in instance documents;
     /// only their substitution group members can.
-    is_abstract: bool,
+    pub is_abstract: bool,
 }
 
 /// Maximum occurrence constraint for particles.
@@ -324,18 +310,18 @@ pub enum WhiteSpaceValue {
 #[derive(Debug, Clone)]
 pub struct ComplexType {
     /// The type name, if this is a named (non-anonymous) type.
-    name: Option<String>,
+    pub name: Option<String>,
     /// The content model of the complex type.
-    content: ComplexContent,
+    pub content: ComplexContent,
     /// Attribute declarations on elements of this type.
-    attributes: Vec<XsdAttribute>,
+    pub attributes: Vec<XsdAttribute>,
     /// Whether the type allows mixed content (text interspersed with elements).
-    mixed: bool,
+    pub mixed: bool,
     /// Base type name from `<xs:complexContent><xs:extension base="...">`.
     ///
     /// When set, the base type's content model particles must appear before
     /// this type's own particles during validation.
-    extension_base: Option<String>,
+    pub extension_base: Option<String>,
 }
 
 /// The content model of a complex type.
@@ -1617,6 +1603,55 @@ fn strip_xs_prefix(name: &str) -> String {
 ///
 /// let doc = Document::parse_str("<note>Hello</note>").unwrap();
 /// let result = validate_xsd(&doc, &schema);
+/// Returns the ordered list of element names from a complex type's sequence.
+///
+/// Looks up the type by name in the schema (including imported namespaces),
+/// then extracts element names from the sequence in declared order.
+/// Returns `None` if the type is not found or has no sequence content.
+pub fn get_type_element_order(type_name: &str, schema: &XsdSchema) -> Option<Vec<String>> {
+    let ct = find_complex_type(type_name, schema)?;
+    extract_element_names(&ct.content)
+}
+
+fn extract_element_names(content: &ComplexContent) -> Option<Vec<String>> {
+    match content {
+        ComplexContent::Sequence(particles) => {
+            let mut names = Vec::new();
+            for p in particles {
+                match p {
+                    XsdParticle::Element(e) => names.push(e.name.clone()),
+                    XsdParticle::Group(g) => {
+                        if let Some(sub) = extract_element_names(g) {
+                            names.extend(sub);
+                        }
+                    }
+                    XsdParticle::Any(_) => {
+                        // Wildcard — skip
+                    }
+                }
+            }
+            Some(names)
+        }
+        ComplexContent::Choice(particles) => {
+            // For choice, collect all element names
+            let mut names = Vec::new();
+            for p in particles {
+                match p {
+                    XsdParticle::Element(e) => names.push(e.name.clone()),
+                    XsdParticle::Group(g) => {
+                        if let Some(sub) = extract_element_names(g) {
+                            names.extend(sub);
+                        }
+                    }
+                    XsdParticle::Any(_) => {}
+                }
+            }
+            Some(names)
+        }
+        _ => None,
+    }
+}
+
 /// assert!(result.is_valid);
 /// ```
 pub fn validate_xsd(doc: &Document, schema: &XsdSchema) -> ValidationResult {
