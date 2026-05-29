@@ -1689,6 +1689,368 @@ pub fn validate_xsd(doc: &Document, schema: &XsdSchema) -> ValidationResult {
     }
 }
 
+/// Strict XSD validation — reports all deviations from the schema.
+///
+/// Like [`validate_xsd`] but additionally:
+/// - Reports unknown/undeclared attributes as errors
+/// - Treats `processContents="strict"` on `<xsd:any>` wildcards as actual
+///   strict validation (attempts to resolve element declarations and reports
+///   errors when elements cannot be validated)
+/// - Reports elements whose type cannot be resolved (instead of silently
+///   accepting them as `anyType`)
+///
+/// # Examples
+///
+/// ```
+/// use xmloxide::Document;
+/// use xmloxide::validation::xsd::{parse_xsd, validate_xsd_strict};
+///
+/// let schema = parse_xsd(r#"
+///   <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+///     <xs:element name="note" type="xs:string"/>
+///   </xs:schema>
+/// "#).unwrap();
+///
+/// let doc = Document::parse_str("<note extra="unknown">Hello</note>").unwrap();
+/// let result = validate_xsd_strict(&doc, &schema);
+/// assert!(!result.is_valid); // unknown attribute reported
+/// ```
+pub fn validate_xsd_strict(doc: &Document, schema: &XsdSchema) -> ValidationResult {
+    let mut errors = Vec::new();
+    let Some(root) = doc.root_element() else {
+        errors.push(ValidationError {
+            message: "document has no root element".to_string(),
+            line: None,
+            column: None,
+        });
+        return ValidationResult {
+            is_valid: false,
+            errors,
+            warnings: vec![],
+        };
+    };
+    let root_name = doc.node_name(root).unwrap_or("");
+    if let Some(decl) = schema.elements.get(root_name) {
+        validate_element_strict(doc, root, decl, schema, &mut errors);
+    } else if let Some(decl) = find_root_element_in_imports(root_name, schema) {
+        validate_element_strict(doc, root, decl, schema, &mut errors);
+    } else {
+        errors.push(ValidationError {
+            message: format!(
+                "element <{root_name}> not declared as a global element in the schema"
+            ),
+            line: None,
+            column: None,
+        });
+    }
+    ValidationResult {
+        is_valid: errors.is_empty(),
+        errors,
+        warnings: vec![],
+    }
+}
+
+/// Strict element validation: validates content and reports unknown attributes.
+fn validate_element_strict(
+    doc: &Document,
+    node: NodeId,
+    decl: &XsdElement,
+    schema: &XsdSchema,
+    errors: &mut Vec<ValidationError>,
+) {
+    match resolve_element_type(decl, schema) {
+        Some(XsdType::Complex(ct)) => {
+            validate_attributes_strict(doc, node, &ct.attributes, schema, errors);
+            validate_complex_element_strict(doc, node, ct, schema, errors);
+        }
+        Some(XsdType::Simple(st)) => {
+            validate_simple_element(doc, node, st, schema, errors);
+            validate_attributes_strict(doc, node, &[], schema, errors);
+        }
+        None => {
+            // Type could not be resolved — in strict mode, report this
+            // but still check for unknown attributes on the element
+            let elem_name = doc.node_name(node).unwrap_or("<unknown>");
+            errors.push(ValidationError {
+                message: format!(
+                    "element <{elem_name}> has no resolvable type declaration"
+                ),
+                line: None,
+                column: None,
+            });
+        }
+    }
+}
+
+/// Strict attribute validation: reports unknown attributes not declared in the schema.
+fn validate_attributes_strict(
+    doc: &Document,
+    node: NodeId,
+    declared_attrs: &[XsdAttribute],
+    schema: &XsdSchema,
+    errors: &mut Vec<ValidationError>,
+) {
+    // First run the normal attribute validation (required, fixed, type checks)
+    validate_attributes(doc, node, declared_attrs, schema, errors);
+
+    // Then check for unknown attributes
+    let elem_name = doc.node_name(node).unwrap_or("<unknown>");
+    let actual_attrs = doc.attributes(node);
+    for attr in actual_attrs.iter() {
+        // Skip xmlns attributes
+        if attr.name.starts_with("xmlns") {
+            continue;
+        }
+        let is_declared = declared_attrs.iter().any(|d| d.name == attr.name);
+        if !is_declared {
+            errors.push(ValidationError {
+                message: format!(
+                    "attribute \"{}\" on element <{elem_name}> is not declared in the schema",
+                    attr.name
+                ),
+                line: None,
+                column: None,
+            });
+        }
+    }
+}
+
+/// Strict complex element validation: validates content with strict any-wildcard handling.
+fn validate_complex_element_strict(
+    doc: &Document,
+    node: NodeId,
+    ct: &ComplexType,
+    schema: &XsdSchema,
+    errors: &mut Vec<ValidationError>,
+) {
+    match &ct.content {
+        ComplexContent::Empty => {
+            validate_empty_content(doc, node, doc.node_name(node).unwrap_or("<unknown>"), ct.mixed, errors);
+        }
+        ComplexContent::Sequence(p) => {
+            let ce = collect_child_elements(doc, node);
+            validate_sequence_strict(doc, &ce, p, doc.node_name(node).unwrap_or("<unknown>"), schema, errors);
+        }
+        ComplexContent::Choice(p) => {
+            let ce = collect_child_elements(doc, node);
+            validate_choice(doc, &ce, p, doc.node_name(node).unwrap_or("<unknown>"), schema, errors);
+        }
+        ComplexContent::All(p) => {
+            let ce = collect_child_elements(doc, node);
+            validate_all(doc, &ce, p, doc.node_name(node).unwrap_or("<unknown>"), schema, errors);
+        }
+        ComplexContent::SimpleContent { base } => {
+            let text = doc.text_content(node);
+            if let Some(XsdType::Simple(st)) = schema.types.get(base.as_str()) {
+                validate_simple_value(&text, st, doc.node_name(node).unwrap_or("<unknown>"), schema, errors);
+            }
+        }
+    }
+}
+
+/// Strict sequence validation: uses strict any-wildcard validation.
+fn validate_sequence_strict(
+    doc: &Document,
+    children: &[NodeId],
+    particles: &[XsdParticle],
+    parent_name: &str,
+    schema: &XsdSchema,
+    errors: &mut Vec<ValidationError>,
+) {
+    let mut idx = 0;
+    for particle in particles {
+        if idx >= children.len() {
+            break;
+        }
+        match particle {
+            XsdParticle::Element(decl) => {
+                // Skip optional elements that don't match
+                if decl.min_occurs == 0 && idx < children.len() {
+                    let child = children[idx];
+                    if !element_matches_decl(doc, child, decl, schema)
+                        && !matches_later_particle(doc, child, &particles[idx..], schema)
+                    {
+                        continue;
+                    }
+                }
+                if element_matches_decl(doc, children[idx], decl, schema) {
+                    validate_element_strict(doc, children[idx], decl, schema, errors);
+                    idx += 1;
+                    // Handle additional occurrences (maxOccurs > 1)
+                    if let MaxOccurs::Bounded(max) = decl.max_occurs {
+                        for _ in 1..max {
+                            if idx >= children.len()
+                                || !element_matches_decl(doc, children[idx], decl, schema)
+                            {
+                                break;
+                            }
+                            validate_element_strict(doc, children[idx], decl, schema, errors);
+                            idx += 1;
+                        }
+                    } else {
+                        // Unbounded
+                        while idx < children.len()
+                            && element_matches_decl(doc, children[idx], decl, schema)
+                        {
+                            validate_element_strict(doc, children[idx], decl, schema, errors);
+                            idx += 1;
+                        }
+                    }
+                } else if decl.min_occurs > 0 {
+                    errors.push(ValidationError {
+                        message: format!(
+                            "element <{}> requires at least {} occurrence(s) of <{}>, found 0",
+                            parent_name, decl.min_occurs, decl.element_ref.as_deref().unwrap_or(&decl.name)
+                        ),
+                        line: None, column: None,
+                    });
+                }
+            }
+            XsdParticle::Group(content) => {
+                let consumed = validate_group_content_strict(
+                    doc,
+                    &children[idx..],
+                    content,
+                    parent_name,
+                    schema,
+                    errors,
+                );
+                idx += consumed;
+            }
+            XsdParticle::Any(any) => {
+                let consumed = validate_any_wildcard_strict(
+                    doc,
+                    &children[idx..],
+                    any,
+                    parent_name,
+                    schema,
+                    errors,
+                );
+                idx += consumed;
+            }
+        }
+    }
+    // Report any remaining unconsumed children as unexpected
+    while idx < children.len() {
+        let unexpected = doc.node_name(children[idx]).unwrap_or("<unknown>");
+        errors.push(ValidationError {
+            message: format!("unexpected element <{unexpected}> in <{parent_name}>; not expected by the content model"),
+            line: None, column: None,
+        });
+        idx += 1;
+    }
+}
+
+/// Strict group content validation.
+fn validate_group_content_strict(
+    doc: &Document,
+    children: &[NodeId],
+    content: &ComplexContent,
+    parent_name: &str,
+    schema: &XsdSchema,
+    errors: &mut Vec<ValidationError>,
+) -> usize {
+    match content {
+        ComplexContent::Sequence(particles) => {
+            validate_sequence_strict(doc, children, particles, parent_name, schema, errors);
+            children.len()
+        }
+        ComplexContent::Choice(particles) => {
+            validate_choice(doc, children, particles, parent_name, schema, errors);
+            children.len()
+        }
+        ComplexContent::All(particles) => {
+            validate_all(doc, children, particles, parent_name, schema, errors);
+            children.len()
+        }
+        _ => 0,
+    }
+}
+
+/// Strict `<xsd:any>` wildcard validation.
+///
+/// Unlike the lax version, this actually attempts to resolve element
+/// declarations for `processContents="strict"` and reports errors when
+/// elements cannot be validated.
+fn validate_any_wildcard_strict(
+    doc: &Document,
+    children: &[NodeId],
+    any: &XsdAny,
+    parent_name: &str,
+    schema: &XsdSchema,
+    errors: &mut Vec<ValidationError>,
+) -> usize {
+    let target_ns = schema.target_namespace.as_deref().unwrap_or("");
+    let mut count: usize = 0;
+
+    for &child in children {
+        let child_ns = doc.node_namespace(child).unwrap_or("");
+        let matches_ns = match &any.namespace {
+            XsdAnyNamespace::Any => true,
+            XsdAnyNamespace::Other => child_ns != target_ns,
+            XsdAnyNamespace::List(ns_list) => {
+                ns_list.iter().any(|ns| child_ns == ns.as_str())
+                    || (ns_list.iter().any(|ns| ns == "##targetNamespace") && child_ns == target_ns)
+                    || (ns_list.iter().any(|ns| ns == "##local") && child_ns.is_empty())
+            }
+        };
+
+        if !matches_ns {
+            break;
+        }
+
+        if let MaxOccurs::Bounded(max) = any.max_occurs {
+            if count >= max as usize {
+                break;
+            }
+        }
+
+        let child_name = doc.node_name(child).unwrap_or("");
+        match any.process_contents {
+            XsdProcessContents::Skip => {
+                // Accept without validation
+            }
+            XsdProcessContents::Lax => {
+                // Validate if declaration found, accept otherwise
+                if let Some(decl) = schema.elements.get(child_name).cloned() {
+                    validate_element_strict(doc, child, &decl, schema, errors);
+                }
+            }
+            XsdProcessContents::Strict => {
+                // Must validate — try to find the element declaration
+                if let Some(decl) = schema.elements.get(child_name).cloned() {
+                    validate_element_strict(doc, child, &decl, schema, errors);
+                } else if let Some(decl) = find_root_element_in_imports(child_name, schema) {
+                    validate_element_strict(doc, child, &decl, schema, errors);
+                } else {
+                    errors.push(ValidationError {
+                        message: format!(
+                            "element <{child_name}> in <{parent_name}> matched xsd:any wildcard but has no declaration in the schema (processContents=strict)"
+                        ),
+                        line: None,
+                        column: None,
+                    });
+                }
+            }
+        }
+
+        count += 1;
+    }
+
+    if count < any.min_occurs as usize {
+        errors.push(ValidationError {
+            message: format!(
+                "element <{parent_name}> requires at least {} wildcard element(s), found {count}",
+                any.min_occurs
+            ),
+            line: None,
+            column: None,
+        });
+    }
+
+    count
+}
+
 /// Searches imported schemas for a global element declaration.
 ///
 /// This handles cases where the root element is declared in an imported
