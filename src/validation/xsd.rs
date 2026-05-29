@@ -531,6 +531,9 @@ pub fn parse_xsd_with_options(
     // Merge complexContent extension base content models.
     merge_extension_bases(&mut schema);
 
+    // Inline attributeGroup references into complex type attributes.
+    resolve_attribute_groups(&mut schema);
+
     Ok(schema)
 }
 
@@ -882,6 +885,75 @@ fn build_substitution_index(schema: &mut XsdSchema) {
     }
 }
 
+/// Resolves `<xs:attributeGroup ref="...">` references by inlining the
+/// referenced group's attributes into each complex type's attribute list.
+///
+/// Handles transitive attributeGroup refs (e.g., AssociationAttributeGroup
+/// → xlink:simpleAttrs) via iterative expansion.
+fn resolve_attribute_groups(schema: &mut XsdSchema) {
+    // Collect all attribute groups (main + imported) into owned data
+    let mut all_groups: HashMap<String, Vec<XsdAttribute>> = HashMap::new();
+    for (name, attrs) in &schema.attribute_groups {
+        all_groups.insert(name.clone(), attrs.clone());
+    }
+    for imp in schema.imported_namespaces.values() {
+        for (name, attrs) in &imp.attribute_groups {
+            all_groups.insert(name.clone(), attrs.clone());
+        }
+    }
+
+    // Iteratively expand attributeGroup placeholders within groups
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut expanded_groups = HashMap::new();
+        for (name, attrs) in &all_groups {
+            let mut result = Vec::new();
+            let mut any_expanded = false;
+            for attr in attrs {
+                if attr.type_ref == "__attr_group__" {
+                    if let Some(group_attrs) = all_groups.get(&attr.name) {
+                        result.extend(group_attrs.clone());
+                        any_expanded = true;
+                        continue;
+                    }
+                }
+                result.push(attr.clone());
+            }
+            if any_expanded {
+                changed = true;
+            }
+            expanded_groups.insert(name.clone(), result);
+        }
+        all_groups = expanded_groups;
+    }
+
+    // Expand attributeGroup placeholders in complex type attributes
+    let expand_types = |types: &mut HashMap<String, XsdType>| {
+        for typ in types.values_mut() {
+            if let XsdType::Complex(ct) = typ {
+                let mut expanded = Vec::new();
+                let orig = std::mem::take(&mut ct.attributes);
+                for attr in orig {
+                    if attr.type_ref == "__attr_group__" {
+                        if let Some(group_attrs) = all_groups.get(&attr.name) {
+                            expanded.extend(group_attrs.clone());
+                            continue;
+                        }
+                    }
+                    expanded.push(attr);
+                }
+                ct.attributes = expanded;
+            }
+        }
+    };
+
+    expand_types(&mut schema.types);
+    for imp in schema.imported_namespaces.values_mut() {
+        expand_types(&mut imp.types);
+    }
+}
+
 /// Merges base-type content models into derived types via `complexContent/extension`.
 ///
 /// XSD 1.0 section 3.4.2: when a complex type is derived by extension,
@@ -1215,6 +1287,21 @@ fn parse_complex_type(doc: &Document, node: NodeId) -> ComplexType {
                     attributes.push(attr);
                 }
             }
+            "attributeGroup" => {
+                if let Some(ref_name) = doc.attribute(child, "ref") {
+                    let local = if let Some((_, l)) = ref_name.split_once(':') {
+                        l.to_string()
+                    } else {
+                        ref_name.to_string()
+                    };
+                    attributes.push(XsdAttribute {
+                        name: local,
+                        type_ref: "__attr_group__".to_string(),
+                        required: false,
+                        fixed: None,
+                    });
+                }
+            }
             "simpleContent" => {
                 content = parse_simple_content(doc, child);
                 collect_simple_content_attributes(doc, child, &mut attributes);
@@ -1532,10 +1619,21 @@ fn parse_facets(doc: &Document, restriction_node: NodeId) -> Vec<Facet> {
 
 /// Parses an `<xs:attribute>` declaration.
 fn parse_attribute_decl(doc: &Document, node: NodeId) -> Option<XsdAttribute> {
-    let name = doc.attribute(node, "name")?.to_string();
-    let type_ref = doc
-        .attribute(node, "type")
-        .map_or_else(|| "string".to_string(), strip_xs_prefix);
+    // Handle both name="..." and ref="prefix:localName"
+    let (name, type_ref) = if let Some(ref_qname) = doc.attribute(node, "ref") {
+        let local = if let Some((_, l)) = ref_qname.split_once(':') {
+            l.to_string()
+        } else {
+            ref_qname.to_string()
+        };
+        (local, "xs:anyURI".to_string())
+    } else {
+        let name = doc.attribute(node, "name")?.to_string();
+        let type_ref = doc
+            .attribute(node, "type")
+            .map_or_else(|| "string".to_string(), strip_xs_prefix);
+        (name, type_ref)
+    };
     let required = doc.attribute(node, "use") == Some("required");
     let fixed = doc.attribute(node, "fixed").map(String::from);
     Some(XsdAttribute {
@@ -1546,12 +1644,34 @@ fn parse_attribute_decl(doc: &Document, node: NodeId) -> Option<XsdAttribute> {
     })
 }
 
-/// Parses all `<xs:attribute>` children of a given node.
+/// Parses all `<xs:attribute>` and `<xs:attributeGroup ref="...">` children
+/// of a given node. AttributeGroup refs are stored as placeholders
+/// (type_ref="__attr_group__") for later expansion.
 fn parse_attributes(doc: &Document, node: NodeId) -> Vec<XsdAttribute> {
-    doc.children(node)
-        .filter(|&c| doc.node_name(c) == Some("attribute"))
-        .filter_map(|c| parse_attribute_decl(doc, c))
-        .collect()
+    let mut attrs = Vec::new();
+    for child in doc.children(node) {
+        let Some(name) = doc.node_name(child) else { continue };
+        if name == "attribute" {
+            if let Some(attr) = parse_attribute_decl(doc, child) {
+                attrs.push(attr);
+            }
+        } else if name == "attributeGroup" {
+            if let Some(ref_name) = doc.attribute(child, "ref") {
+                let local = if let Some((_, l)) = ref_name.split_once(':') {
+                    l.to_string()
+                } else {
+                    ref_name.to_string()
+                };
+                attrs.push(XsdAttribute {
+                    name: local,
+                    type_ref: "__attr_group__".to_string(),
+                    required: false,
+                    fixed: None,
+                });
+            }
+        }
+    }
+    attrs
 }
 
 /// Builds a prefix-to-namespace-URI map from `xmlns:*` attributes on a node.
@@ -1817,8 +1937,14 @@ fn validate_attributes_strict(
     let elem_name = doc.node_name(node).unwrap_or("<unknown>");
     let actual_attrs = doc.attributes(node);
     for attr in actual_attrs.iter() {
-        // Skip xmlns attributes
-        if attr.name.starts_with("xmlns") {
+        // Skip xmlns namespace declarations
+        // xmloxide stores xmlns:foo as prefix="xmlns", name="foo"
+        // and the default namespace as name="xmlns"
+        if attr.prefix.as_deref() == Some("xmlns") || attr.name == "xmlns" {
+            continue;
+        }
+        // Skip xsi:* attributes (standard XSI, not user schema)
+        if attr.prefix.as_deref() == Some("xsi") {
             continue;
         }
         let is_declared = declared_attrs.iter().any(|d| d.name == attr.name);
