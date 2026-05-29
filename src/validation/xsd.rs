@@ -1343,13 +1343,23 @@ enum CompositorKind {
 /// Parses a compositor (`<xs:sequence>`, `<xs:choice>`, or `<xs:all>`).
 fn parse_compositor(doc: &Document, node: NodeId, kind: CompositorKind) -> ComplexContent {
     let mut particles = Vec::new();
+    // Read compositor-level minOccurs/maxOccurs.
+    // XSD 1.0: these apply to the group as a whole.
+    // When minOccurs=0, all direct element children become effectively optional.
+    let compositor_min = parse_min_occurs(doc, node);
     for child in doc.children(node) {
         let Some(child_name) = doc.node_name(child) else {
             continue;
         };
         match child_name {
             "element" => {
-                if let Some(elem) = parse_element_decl(doc, child) {
+                if let Some(mut elem) = parse_element_decl(doc, child) {
+                    // If the compositor itself is optional (minOccurs=0),
+                    // propagate that to element children so the validator
+                    // doesn't require them.
+                    if compositor_min == 0 {
+                        elem.min_occurs = 0;
+                    }
                     particles.push(XsdParticle::Element(elem));
                 }
             }
@@ -1387,6 +1397,16 @@ fn parse_compositor(doc: &Document, node: NodeId, kind: CompositorKind) -> Compl
         CompositorKind::Choice => ComplexContent::Choice(particles),
         CompositorKind::All => ComplexContent::All(particles),
     }
+}
+
+/// Parses the `minOccurs` attribute from a particle node.
+/// Returns 0 when not specified (XSD default for compositor-level is 1,
+/// but individual element defaults are also 1 — we handle that in
+/// `parse_element_decl`).
+fn parse_min_occurs(doc: &Document, node: NodeId) -> u32 {
+    doc.attribute(node, "minOccurs")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
 }
 
 /// Parses `<xs:simpleContent>` within a complex type.
@@ -5268,6 +5288,7 @@ fn test_nas_substitution_group_resolution() {
     let nas_xml = std::fs::read_to_string(nas_file).unwrap();
     let nas_doc = Document::parse_str(&nas_xml).unwrap();
     let result = validate_xsd(&nas_doc, &schema);
+    eprintln!("  is_valid={}", result.is_valid);
     for err in &result.errors {
         eprintln!("  ERROR: {}", err.message);
     }
@@ -5370,4 +5391,93 @@ fn test_root_element_from_imported_schema() {
     let result_bad = validate_xsd(&doc_bad, &schema);
     assert!(!result_bad.is_valid,
         "wrong element order should be detected: {:?}", result_bad.errors);
+}
+
+/// Test that compositor-level minOccurs propagates to child elements.
+///
+/// When a `<sequence minOccurs="0">` contains an element with default
+/// `minOccurs=1`, the validator should not require the element because
+/// the entire sequence is optional.
+#[test]
+fn test_compositor_min_occurs_propagation() {
+    let schema = parse_xsd(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="RootType"/>
+            <xs:complexType name="RootType">
+                <xs:sequence>
+                    <xs:element name="a" type="xs:string"/>
+                    <xs:sequence minOccurs="0">
+                        <xs:element name="b" type="xs:string"/>
+                    </xs:sequence>
+                </xs:sequence>
+            </xs:complexType>
+        </xs:schema>"#,
+    )
+    .unwrap();
+
+    // "a" is required, "b" is inside an optional sequence
+    let doc = Document::parse_str(r#"<root><a>hello</a></root>"#).unwrap();
+    let result = validate_xsd(&doc, &schema);
+    assert!(
+        result.is_valid,
+        "optional sequence content should not be required: {:?}",
+        result.errors
+    );
+
+    // But "a" IS required
+    let doc_missing_a = Document::parse_str(r#"<root><b>hello</b></root>"#).unwrap();
+    let result_a = validate_xsd(&doc_missing_a, &schema);
+    assert!(!result_a.is_valid, "'a' should be required");
+}
+
+/// Test that compositor-level minOccurs=0 works with GML-style property types.
+///
+/// Mirrors gml:CRSPropertyType where `<sequence minOccurs="0"><element ref="T"/>`.
+#[test]
+fn test_gml_style_optional_sequence_ref() {
+    let schema = parse_xsd(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                   xmlns:gml="http://example.com/gml"
+                   targetNamespace="http://example.com/gml">
+            <xs:element name="AbstractCRS" type="xs:string" abstract="true"/>
+            <xs:element name="GeodeticCRS" substitutionGroup="gml:AbstractCRS" type="xs:string"/>
+            <xs:complexType name="CRSPropertyType">
+                <xs:sequence minOccurs="0">
+                    <xs:element ref="gml:AbstractCRS"/>
+                </xs:sequence>
+                <xs:attribute name="href" type="xs:anyURI"/>
+            </xs:complexType>
+            <xs:element name="root" type="RootType"/>
+            <xs:complexType name="RootType">
+                <xs:sequence>
+                    <xs:element name="crs" type="gml:CRSPropertyType"/>
+                </xs:sequence>
+            </xs:complexType>
+        </xs:schema>"#,
+    )
+    .unwrap();
+
+    // crs with only href, no AbstractCRS child (sequence minOccurs=0)
+    let doc = Document::parse_str(
+        r#"<root xmlns="http://example.com/gml" xmlns:gml="http://example.com/gml"><crs href="urn:ogc:crs:EPSG::4326"/></root>"#,
+    )
+    .unwrap();
+    let result = validate_xsd(&doc, &schema);
+    assert!(
+        result.is_valid,
+        "empty crs should be valid (optional sequence): {:?}",
+        result.errors
+    );
+
+    // crs with substitution group member child
+    let doc2 = Document::parse_str(
+        r##"<root xmlns="http://example.com/gml" xmlns:gml="http://example.com/gml"><crs href="#crs1"><GeodeticCRS>EPSG:4326</GeodeticCRS></crs></root>"##,
+    )
+    .unwrap();
+    let result2 = validate_xsd(&doc2, &schema);
+    assert!(
+        result2.is_valid,
+        "substitution group member should be valid: {:?}",
+        result2.errors
+    );
 }
