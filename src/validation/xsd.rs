@@ -981,8 +981,9 @@ fn merge_extension_bases(schema: &mut XsdSchema) {
 
     for (type_name, base_name) in main_extensions {
         let base_particles = resolve_base_particles(&base_name, schema);
-        if base_particles.is_empty() { continue; }
-        merge_type_extension(&mut schema.types, &type_name, base_particles);
+        let base_attrs = resolve_base_attributes(&base_name, schema);
+        if base_particles.is_empty() && base_attrs.is_empty() { continue; }
+        merge_type_extension(&mut schema.types, &type_name, base_particles, base_attrs);
     }
 
     // Imported namespace extensions
@@ -1002,9 +1003,10 @@ fn merge_extension_bases(schema: &mut XsdSchema) {
 
     for (type_name, base_name) in imported_extensions {
         let base_particles = resolve_base_particles(&base_name, schema);
-        if base_particles.is_empty() { continue; }
+        let base_attrs = resolve_base_attributes(&base_name, schema);
+        if base_particles.is_empty() && base_attrs.is_empty() { continue; }
         for imp in schema.imported_namespaces.values_mut() {
-            merge_type_extension(&mut imp.types, &type_name, base_particles.clone());
+            merge_type_extension(&mut imp.types, &type_name, base_particles.clone(), base_attrs.clone());
         }
     }
 }
@@ -1013,8 +1015,10 @@ fn merge_type_extension(
     types: &mut HashMap<String, XsdType>,
     type_name: &str,
     base_particles: Vec<XsdParticle>,
+    base_attrs: Vec<XsdAttribute>,
 ) {
     if let Some(XsdType::Complex(ct)) = types.get_mut(type_name) {
+        // Merge content model particles
         match &mut ct.content {
             ComplexContent::Sequence(ext_particles) => {
                 let mut merged = base_particles;
@@ -1032,8 +1036,52 @@ fn merge_type_extension(
             }
             ComplexContent::SimpleContent { .. } => {}
         }
+        // Merge base attributes before extension attributes
+        if !base_attrs.is_empty() {
+            let mut merged_attrs = base_attrs;
+            merged_attrs.append(&mut ct.attributes);
+            ct.attributes = merged_attrs;
+        }
         ct.extension_base = None;
     }
+}
+
+/// Resolves a type's attributes, chasing extension chains.
+/// Returns all inherited attributes from the full type hierarchy.
+fn resolve_base_attributes(type_name: &str, schema: &XsdSchema) -> Vec<XsdAttribute> {
+    resolve_base_attributes_impl(type_name, schema, &mut HashSet::new())
+}
+
+fn resolve_base_attributes_impl(
+    type_name: &str,
+    schema: &XsdSchema,
+    visited: &mut HashSet<String>,
+) -> Vec<XsdAttribute> {
+    let local_name = if let Some((_, l)) = type_name.split_once(':') {
+        l
+    } else {
+        type_name
+    };
+
+    if !visited.insert(local_name.to_string()) {
+        return Vec::new();
+    }
+
+    let ct = match find_complex_type(local_name, schema) {
+        Some(ct) => ct,
+        _ => return Vec::new(),
+    };
+
+    // Recursively get base attributes first
+    let mut attrs = if let Some(ref base) = ct.extension_base {
+        resolve_base_attributes_impl(base, schema, visited)
+    } else {
+        Vec::new()
+    };
+
+    // Then add this type's own attributes
+    attrs.extend(ct.attributes.clone());
+    attrs
 }
 
 /// Resolves a type's content model particles, chasing extension chains.
@@ -1361,6 +1409,21 @@ fn parse_complex_content(
                                 attributes.push(attr);
                             }
                         }
+                        "attributeGroup" => {
+                            if let Some(ref_name) = doc.attribute(ext_child, "ref") {
+                                let local = if let Some((_, l)) = ref_name.split_once(':') {
+                                    l.to_string()
+                                } else {
+                                    ref_name.to_string()
+                                };
+                                attributes.push(XsdAttribute {
+                                    name: local,
+                                    type_ref: "__attr_group__".to_string(),
+                                    required: false,
+                                    fixed: None,
+                                });
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1386,6 +1449,21 @@ fn parse_complex_content(
                         "attribute" => {
                             if let Some(attr) = parse_attribute_decl(doc, restr_child) {
                                 attributes.push(attr);
+                            }
+                        }
+                        "attributeGroup" => {
+                            if let Some(ref_name) = doc.attribute(restr_child, "ref") {
+                                let local = if let Some((_, l)) = ref_name.split_once(':') {
+                                    l.to_string()
+                                } else {
+                                    ref_name.to_string()
+                                };
+                                attributes.push(XsdAttribute {
+                                    name: local,
+                                    type_ref: "__attr_group__".to_string(),
+                                    required: false,
+                                    fixed: None,
+                                });
                             }
                         }
                         _ => {}
@@ -2160,6 +2238,8 @@ fn validate_any_wildcard_strict(
                 // Validate if declaration found, accept otherwise
                 if let Some(decl) = schema.elements.get(child_name).cloned() {
                     validate_element_strict(doc, child, &decl, schema, errors);
+                } else if let Some(decl) = find_root_element_in_imports(child_name, schema).cloned() {
+                    validate_element_strict(doc, child, &decl, schema, errors);
                 }
             }
             XsdProcessContents::Strict => {
@@ -2572,6 +2652,17 @@ fn element_matches_decl(
             if child_ns.is_empty() && decl.element_ref.is_some() {
                 return true;
             }
+            // For local element declarations (no ref), allow if the child
+            // namespace matches any imported schema's namespace.
+            // Local elements inherit their namespace from the type's schema.
+            if decl.element_ref.is_none() {
+                let imported_ns_match = schema
+                    .imported_namespaces
+                    .keys()
+                    .any(|imp_ns| child_ns == imp_ns.as_str());
+                let main_ns_match = child_ns == ns.as_str();
+                return imported_ns_match || main_ns_match;
+            }
             child_ns == ns.as_str()
         }
         None => true,
@@ -2805,7 +2896,33 @@ fn validate_choice(
                 // Wildcard matches any element — accept
                 true
             }
-            _ => false,
+            XsdParticle::Group(ct) => {
+                // Try to match the first child against the group's
+                // content model (handles sequences/choices nested in choice)
+                match ct {
+                    ComplexContent::Sequence(seq_particles) => {
+                        if let Some(first_particle) = seq_particles.first() {
+                            if let XsdParticle::Element(decl) = first_particle {
+                                if element_matches_decl(doc, first, decl, schema) {
+                                    // Validate the entire sequence against children
+                                    validate_sequence(doc, children, seq_particles, parent_name, schema, errors);
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                    ComplexContent::Choice(choice_particles) => {
+                        // Recurse: try to match child against choice alternatives
+                        let mut sub_errors = Vec::new();
+                        validate_choice(doc, children, choice_particles, parent_name, schema, &mut sub_errors);
+                        if sub_errors.is_empty() {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+                false
+            }
         }
     });
     if !matched {
@@ -5607,3 +5724,40 @@ fn test_gml_style_optional_sequence_ref() {
         result2.errors
     );
 }
+
+#[cfg(test)]
+mod test_envelope_lowercorner {
+    use super::*;
+
+    #[test]
+    fn test_envelope_with_lower_upper_corner() {
+        let schema = parse_xsd(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                   xmlns:gml="http://example.com/gml"
+                   targetNamespace="http://example.com/gml">
+                <xs:complexType name="EnvelopeType">
+                    <xs:choice>
+                        <xs:sequence>
+                            <xs:element name="lowerCorner" type="xs:string"/>
+                            <xs:element name="upperCorner" type="xs:string"/>
+                        </xs:sequence>
+                        <xs:element ref="gml:pos" minOccurs="2" maxOccurs="2"/>
+                        <xs:element ref="gml:coordinates"/>
+                    </xs:choice>
+                </xs:complexType>
+                <xs:element name="pos" type="xs:string"/>
+                <xs:element name="coordinates" type="xs:string"/>
+                <xs:element name="root" type="gml:EnvelopeType"/>
+            </xs:schema>"#,
+        )
+        .unwrap();
+
+        let doc = Document::parse_str(
+            r#"<root xmlns="http://example.com/gml"><lowerCorner>1 2</lowerCorner><upperCorner>3 4</upperCorner></root>"#,
+        )
+        .unwrap();
+        let result = validate_xsd(&doc, &schema);
+        assert!(result.is_valid, "lowerCorner/upperCorner should be valid: {:?}", result.errors);
+    }
+}
+
