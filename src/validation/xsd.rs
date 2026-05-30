@@ -181,7 +181,7 @@ pub struct XsdElement {
     pub min_occurs: u32,
     /// Maximum number of occurrences (default 1 for local elements).
     pub max_occurs: MaxOccurs,
-    /// The `substitutionGroup` attribute (QName of the head element).
+    /// The `substitutionGroup` attribute (`QName` of the head element).
     ///
     /// See XSD 1.0 section 3.3.6: when set, this element can appear anywhere
     /// the head element is expected in a content model.
@@ -738,6 +738,7 @@ fn handle_include(
 /// storing its declarations under the imported namespace.
 ///
 /// See XSD 1.0 section 4.2.3.
+#[allow(clippy::too_many_lines)]
 fn handle_import(
     doc: &Document,
     node: NodeId,
@@ -926,7 +927,7 @@ fn build_substitution_index(schema: &mut XsdSchema) {
 /// Resolves `<xs:attributeGroup ref="...">` references by inlining the
 /// referenced group's attributes into each complex type's attribute list.
 ///
-/// Handles transitive attributeGroup refs (e.g., AssociationAttributeGroup
+/// Handles transitive attributeGroup refs (e.g., `AssociationAttributeGroup`
 /// → xlink:simpleAttrs) via iterative expansion.
 fn resolve_attribute_groups(schema: &mut XsdSchema) {
     // Collect all attribute groups (main + imported) into owned data
@@ -1003,14 +1004,16 @@ fn resolve_attribute_groups(schema: &mut XsdSchema) {
 fn merge_extension_bases(schema: &mut XsdSchema) {
     // Collect ALL extensions (main + imported) first, then merge.
     // This avoids borrow conflicts between mutable types and immutable schema.
-    
+
     // Main schema extensions
     let main_extensions: Vec<(String, String)> = schema
         .types
         .iter()
         .filter_map(|(name, ty)| {
             if let XsdType::Complex(ct) = ty {
-                ct.extension_base.as_ref().map(|base| (name.clone(), base.clone()))
+                ct.extension_base
+                    .as_ref()
+                    .map(|base| (name.clone(), base.clone()))
             } else {
                 None
             }
@@ -1020,7 +1023,9 @@ fn merge_extension_bases(schema: &mut XsdSchema) {
     for (type_name, base_name) in main_extensions {
         let base_particles = resolve_base_particles(&base_name, schema);
         let base_attrs = resolve_base_attributes(&base_name, schema);
-        if base_particles.is_empty() && base_attrs.is_empty() { continue; }
+        if base_particles.is_empty() && base_attrs.is_empty() {
+            continue;
+        }
         merge_type_extension(&mut schema.types, &type_name, base_particles, base_attrs);
     }
 
@@ -1109,9 +1114,8 @@ fn resolve_base_attributes_impl(
         return Vec::new();
     }
 
-    let ct = match find_complex_type(local_name, schema) {
-        Some(ct) => ct,
-        _ => return Vec::new(),
+    let Some(ct) = find_complex_type(local_name, schema) else {
+        return Vec::new();
     };
 
     // Recursively get base attributes first
@@ -1165,9 +1169,8 @@ fn resolve_base_particles_impl(
         return Vec::new(); // Cycle detected, stop
     }
 
-    let ct = match find_complex_type(local_name, schema) {
-        Some(ct) => ct,
-        _ => return Vec::new(),
+    let Some(ct) = find_complex_type(local_name, schema) else {
+        return Vec::new();
     };
 
     // Recursively resolve base type particles first
@@ -1180,14 +1183,13 @@ fn resolve_base_particles_impl(
     // Then append this type's own particles
     match &ct.content {
         ComplexContent::Sequence(p) => particles.extend(p.iter().cloned()),
-        ComplexContent::Empty => {}
+        ComplexContent::Empty | ComplexContent::SimpleContent { .. } => {}
         ComplexContent::Choice(p) => {
-            particles.push(XsdParticle::Group(ComplexContent::Choice(p.clone())))
+            particles.push(XsdParticle::Group(ComplexContent::Choice(p.clone())));
         }
         ComplexContent::All(p) => {
-            particles.push(XsdParticle::Group(ComplexContent::All(p.clone())))
+            particles.push(XsdParticle::Group(ComplexContent::All(p.clone())));
         }
-        ComplexContent::SimpleContent { .. } => {}
     }
 
     particles
@@ -1242,21 +1244,15 @@ fn register_builtin_types(schema: &mut XsdSchema) {
 /// Handles both named declarations (`name="foo" type="xs:string"`) and
 /// element references (`ref="cbc:ID"`). For references, the `ref` `QName`
 /// Parses an `<xs:any>` element wildcard declaration.
-fn parse_any_wildcard(doc: &Document, node: NodeId) -> Option<XsdAny> {
+fn parse_any_wildcard(doc: &Document, node: NodeId) -> XsdAny {
     let namespace_str = doc.attribute(node, "namespace").unwrap_or("##any");
     let namespace = match namespace_str {
         "##any" => XsdAnyNamespace::Any,
         "##other" => XsdAnyNamespace::Other,
-        other => XsdAnyNamespace::List(
-            other
-                .split_whitespace()
-                .map(String::from)
-                .collect(),
-        ),
+        other => XsdAnyNamespace::List(other.split_whitespace().map(String::from).collect()),
     };
 
     let process_contents = match doc.attribute(node, "processContents").unwrap_or("") {
-        "strict" => XsdProcessContents::Strict,
         "lax" => XsdProcessContents::Lax,
         "skip" => XsdProcessContents::Skip,
         _ => XsdProcessContents::Strict,
@@ -1268,21 +1264,20 @@ fn parse_any_wildcard(doc: &Document, node: NodeId) -> Option<XsdAny> {
         .unwrap_or(1);
     let max_occurs = doc
         .attribute(node, "maxOccurs")
-        .map(|s| {
+        .map_or(MaxOccurs::Bounded(1), |s| {
             if s == "unbounded" {
                 MaxOccurs::Unbounded
             } else {
                 MaxOccurs::Bounded(s.parse::<u32>().unwrap_or(1))
             }
-        })
-        .unwrap_or(MaxOccurs::Bounded(1));
+        });
 
-    Some(XsdAny {
+    XsdAny {
         namespace,
         process_contents,
         min_occurs,
         max_occurs,
-    })
+    }
 }
 
 /// Parses an `<xs:element>` declaration within a content model. Element refs
@@ -1326,7 +1321,7 @@ fn parse_element_decl(doc: &Document, node: NodeId) -> Option<XsdElement> {
     let substitution_group = doc.attribute(node, "substitutionGroup").map(String::from);
     let is_abstract = doc
         .attribute(node, "abstract")
-        .map_or(false, |v| v == "true" || v == "1");
+        .is_some_and(|v| v == "true" || v == "1");
     Some(XsdElement {
         name,
         type_ref,
@@ -1380,10 +1375,14 @@ fn parse_complex_type(
         };
         match child_name {
             "sequence" => {
-                content = parse_compositor(doc, child, CompositorKind::Sequence, group_defs)
+                content = parse_compositor(doc, child, CompositorKind::Sequence, group_defs);
             }
-            "choice" => content = parse_compositor(doc, child, CompositorKind::Choice, group_defs),
-            "all" => content = parse_compositor(doc, child, CompositorKind::All, group_defs),
+            "choice" => {
+                content = parse_compositor(doc, child, CompositorKind::Choice, group_defs);
+            }
+            "all" => {
+                content = parse_compositor(doc, child, CompositorKind::All, group_defs);
+            }
             "attribute" => {
                 if let Some(attr) = parse_attribute_decl(doc, child) {
                     attributes.push(attr);
@@ -1431,6 +1430,7 @@ fn parse_complex_type(
 /// Returns `(base_type_name, content_model, extra_attributes)`.
 /// The content model contains only the extension's own particles;
 /// base-type merging is done in [`merge_extension_bases`].
+#[allow(clippy::too_many_lines)]
 fn parse_complex_content(
     doc: &Document,
     cc_node: NodeId,
@@ -1441,12 +1441,16 @@ fn parse_complex_content(
     let mut attributes = Vec::new();
 
     for cc_child in doc.children(cc_node) {
-        let Some(cc_name) = doc.node_name(cc_child) else { continue };
+        let Some(cc_name) = doc.node_name(cc_child) else {
+            continue;
+        };
         match cc_name {
             "extension" => {
                 base = doc.attribute(cc_child, "base").map(String::from);
                 for ext_child in doc.children(cc_child) {
-                    let Some(ext_name) = doc.node_name(ext_child) else { continue };
+                    let Some(ext_name) = doc.node_name(ext_child) else {
+                        continue;
+                    };
                     match ext_name {
                         "sequence" => {
                             content = parse_compositor(
@@ -1454,7 +1458,7 @@ fn parse_complex_content(
                                 ext_child,
                                 CompositorKind::Sequence,
                                 group_defs,
-                            )
+                            );
                         }
                         "choice" => {
                             content = parse_compositor(
@@ -1462,11 +1466,11 @@ fn parse_complex_content(
                                 ext_child,
                                 CompositorKind::Choice,
                                 group_defs,
-                            )
+                            );
                         }
                         "all" => {
                             content =
-                                parse_compositor(doc, ext_child, CompositorKind::All, group_defs)
+                                parse_compositor(doc, ext_child, CompositorKind::All, group_defs);
                         }
                         "attribute" => {
                             if let Some(attr) = parse_attribute_decl(doc, ext_child) {
@@ -1494,9 +1498,11 @@ fn parse_complex_content(
             }
             "restriction" => {
                 // restriction replaces the base content model entirely
-                base = doc.attribute(cc_child, "base").map(String::from);
+                let _base = doc.attribute(cc_child, "base").map(String::from);
                 for restr_child in doc.children(cc_child) {
-                    let Some(restr_name) = doc.node_name(restr_child) else { continue };
+                    let Some(restr_name) = doc.node_name(restr_child) else {
+                        continue;
+                    };
                     match restr_name {
                         "sequence" => {
                             content = parse_compositor(
@@ -1504,7 +1510,7 @@ fn parse_complex_content(
                                 restr_child,
                                 CompositorKind::Sequence,
                                 group_defs,
-                            )
+                            );
                         }
                         "choice" => {
                             content = parse_compositor(
@@ -1512,15 +1518,11 @@ fn parse_complex_content(
                                 restr_child,
                                 CompositorKind::Choice,
                                 group_defs,
-                            )
+                            );
                         }
                         "all" => {
-                            content = parse_compositor(
-                                doc,
-                                restr_child,
-                                CompositorKind::All,
-                                group_defs,
-                            )
+                            content =
+                                parse_compositor(doc, restr_child, CompositorKind::All, group_defs);
                         }
                         "attribute" => {
                             if let Some(attr) = parse_attribute_decl(doc, restr_child) {
@@ -1653,13 +1655,15 @@ fn parse_compositor(
     // XSD 1.0: these apply to the group as a whole.
     // When minOccurs=0, all direct element children become effectively optional.
     let compositor_min = parse_min_occurs(doc, node);
-    let compositor_max = doc.attribute(node, "maxOccurs").map_or(MaxOccurs::Bounded(1), |v| {
-        if v == "unbounded" {
-            MaxOccurs::Unbounded
-        } else {
-            MaxOccurs::Bounded(v.parse::<u32>().unwrap_or(1))
-        }
-    });
+    let compositor_max = doc
+        .attribute(node, "maxOccurs")
+        .map_or(MaxOccurs::Bounded(1), |v| {
+            if v == "unbounded" {
+                MaxOccurs::Unbounded
+            } else {
+                MaxOccurs::Bounded(v.parse::<u32>().unwrap_or(1))
+            }
+        });
 
     for child in doc.children(node) {
         let Some(child_name) = doc.node_name(child) else {
@@ -1714,9 +1718,8 @@ fn parse_compositor(
                 }
             }
             "any" => {
-                if let Some(any) = parse_any_wildcard(doc, child) {
-                    particles.push(XsdParticle::Any(any));
-                }
+                let any = parse_any_wildcard(doc, child);
+                particles.push(XsdParticle::Any(any));
             }
             _ => {}
         }
@@ -1726,7 +1729,6 @@ fn parse_compositor(
     if particles.len() == 1 {
         if let XsdParticle::Element(elem) = &mut particles[0] {
             match compositor_max {
-                MaxOccurs::Unbounded => elem.max_occurs = MaxOccurs::Unbounded,
                 MaxOccurs::Bounded(n) if n > 1 => elem.max_occurs = MaxOccurs::Bounded(n),
                 _ => {}
             }
@@ -1899,12 +1901,14 @@ fn parse_attribute_decl(doc: &Document, node: NodeId) -> Option<XsdAttribute> {
 }
 
 /// Parses all `<xs:attribute>` and `<xs:attributeGroup ref="...">` children
-/// of a given node. AttributeGroup refs are stored as placeholders
-/// (type_ref="__attr_group__") for later expansion.
+/// of a given node. `AttributeGroup` refs are stored as placeholders
+/// (`type_ref`="__`attr_group`__") for later expansion.
 fn parse_attributes(doc: &Document, node: NodeId) -> Vec<XsdAttribute> {
     let mut attrs = Vec::new();
     for child in doc.children(node) {
-        let Some(name) = doc.node_name(child) else { continue };
+        let Some(name) = doc.node_name(child) else {
+            continue;
+        };
         if name == "attribute" {
             if let Some(attr) = parse_attribute_decl(doc, child) {
                 attrs.push(attr);
@@ -1997,7 +2001,8 @@ fn strip_xs_prefix(name: &str) -> String {
 ///
 /// let doc = Document::parse_str("<note>Hello</note>").unwrap();
 /// let result = validate_xsd(&doc, &schema);
-/// Returns the ordered list of element names from a complex type's sequence.
+/// assert!(result.is_valid);
+/// ```
 ///
 /// Looks up the type by name in the schema (including imported namespaces),
 /// then extracts element names from the sequence in declared order.
@@ -2046,7 +2051,7 @@ fn extract_element_names(content: &ComplexContent) -> Option<Vec<String>> {
     }
 }
 
-/// assert!(result.is_valid);
+/// `assert!(result.is_valid)`;
 /// ```
 pub fn validate_xsd(doc: &Document, schema: &XsdSchema) -> ValidationResult {
     let mut errors = Vec::new();
@@ -2105,7 +2110,7 @@ pub fn validate_xsd(doc: &Document, schema: &XsdSchema) -> ValidationResult {
 ///   </xs:schema>
 /// "#).unwrap();
 ///
-/// let doc = Document::parse_str("<note extra="unknown">Hello</note>").unwrap();
+/// let doc = Document::parse_str(r#"<note extra="unknown">Hello</note>"#).unwrap();
 /// let result = validate_xsd_strict(&doc, &schema);
 /// assert!(!result.is_valid); // unknown attribute reported
 /// ```
@@ -2197,8 +2202,7 @@ fn resolve_simple_content_base_attributes_impl(
 ) -> Vec<XsdAttribute> {
     let local = base_type
         .split_once(':')
-        .map(|(_, l)| l)
-        .unwrap_or(base_type)
+        .map_or(base_type, |(_, l)| l)
         .to_string();
     if !visited.insert(local.clone()) {
         return Vec::new();
@@ -2236,7 +2240,7 @@ fn validate_attributes_strict(
     // Then check for unknown attributes
     let elem_name = doc.node_name(node).unwrap_or("<unknown>");
     let actual_attrs = doc.attributes(node);
-    for attr in actual_attrs.iter() {
+    for attr in actual_attrs {
         // Skip xmlns namespace declarations
         // xmloxide stores xmlns:foo as prefix="xmlns", name="foo"
         // and the default namespace as name="xmlns"
@@ -2271,7 +2275,13 @@ fn validate_complex_element_strict(
 ) {
     match &ct.content {
         ComplexContent::Empty => {
-            validate_empty_content(doc, node, doc.node_name(node).unwrap_or("<unknown>"), ct.mixed, errors);
+            validate_empty_content(
+                doc,
+                node,
+                doc.node_name(node).unwrap_or("<unknown>"),
+                ct.mixed,
+                errors,
+            );
         }
         ComplexContent::Sequence(p) => {
             let ce = collect_child_elements(doc, node);
@@ -2289,16 +2299,36 @@ fn validate_complex_element_strict(
         }
         ComplexContent::Choice(p) => {
             let ce = collect_child_elements(doc, node);
-            validate_choice(doc, &ce, p, doc.node_name(node).unwrap_or("<unknown>"), schema, errors);
+            validate_choice(
+                doc,
+                &ce,
+                p,
+                doc.node_name(node).unwrap_or("<unknown>"),
+                schema,
+                errors,
+            );
         }
         ComplexContent::All(p) => {
             let ce = collect_child_elements(doc, node);
-            validate_all(doc, &ce, p, doc.node_name(node).unwrap_or("<unknown>"), schema, errors);
+            validate_all(
+                doc,
+                &ce,
+                p,
+                doc.node_name(node).unwrap_or("<unknown>"),
+                schema,
+                errors,
+            );
         }
         ComplexContent::SimpleContent { base } => {
             let text = doc.text_content(node);
             if let Some(XsdType::Simple(st)) = schema.types.get(base.as_str()) {
-                validate_simple_value(&text, st, doc.node_name(node).unwrap_or("<unknown>"), schema, errors);
+                validate_simple_value(
+                    &text,
+                    st,
+                    doc.node_name(node).unwrap_or("<unknown>"),
+                    schema,
+                    errors,
+                );
             }
         }
     }
@@ -2350,7 +2380,8 @@ fn validate_sequence_strict(
                     }
                 }
                 if element_matches_decl(doc, children[idx], decl, schema) {
-                    let effective = resolve_substitution_member_decl(doc, children[idx], decl, schema);
+                    let effective =
+                        resolve_substitution_member_decl(doc, children[idx], decl, schema);
                     validate_element_strict(doc, children[idx], effective, schema, errors);
                     idx += 1;
                     // Handle additional occurrences (maxOccurs > 1)
@@ -2381,9 +2412,12 @@ fn validate_sequence_strict(
                     errors.push(ValidationError {
                         message: format!(
                             "element <{}> requires at least {} occurrence(s) of <{}>, found 0",
-                            parent_name, decl.min_occurs, decl.element_ref.as_deref().unwrap_or(&decl.name)
+                            parent_name,
+                            decl.min_occurs,
+                            decl.element_ref.as_deref().unwrap_or(&decl.name)
                         ),
-                        line: None, column: None,
+                        line: None,
+                        column: None,
                     });
                 }
             }
@@ -2512,7 +2546,8 @@ fn validate_any_wildcard_strict(
                 // Validate if declaration found, accept otherwise
                 if let Some(decl) = schema.elements.get(child_name).cloned() {
                     validate_element_strict(doc, child, &decl, schema, errors);
-                } else if let Some(decl) = find_root_element_in_imports(child_name, schema).cloned() {
+                } else if let Some(decl) = find_root_element_in_imports(child_name, schema).cloned()
+                {
                     validate_element_strict(doc, child, &decl, schema, errors);
                 }
             }
@@ -2521,7 +2556,7 @@ fn validate_any_wildcard_strict(
                 if let Some(decl) = schema.elements.get(child_name).cloned() {
                     validate_element_strict(doc, child, &decl, schema, errors);
                 } else if let Some(decl) = find_root_element_in_imports(child_name, schema) {
-                    validate_element_strict(doc, child, &decl, schema, errors);
+                    validate_element_strict(doc, child, decl, schema, errors);
                 } else {
                     errors.push(ValidationError {
                         message: format!(
@@ -2771,9 +2806,8 @@ fn validate_sequence(
                 // it's out-of-order or unexpected.
                 if consumed == 0 && idx < children.len() {
                     let child = children[idx];
-                    let matches_later = matches_later_particle(
-                        doc, child, &particles[particle_idx + 1..], schema,
-                    );
+                    let matches_later =
+                        matches_later_particle(doc, child, &particles[particle_idx + 1..], schema);
                     if !matches_later {
                         let child_name = doc.node_name(child).unwrap_or("<unknown>");
                         errors.push(ValidationError {
@@ -2799,14 +2833,8 @@ fn validate_sequence(
                 idx += consumed;
             }
             XsdParticle::Any(any) => {
-                let consumed = validate_any_wildcard(
-                    doc,
-                    &children[idx..],
-                    any,
-                    parent_name,
-                    schema,
-                    errors,
-                );
+                let consumed =
+                    validate_any_wildcard(doc, &children[idx..], any, parent_name, schema, errors);
                 idx += consumed;
             }
         }
@@ -2855,7 +2883,7 @@ fn matches_later_group(
 ) -> bool {
     match content {
         ComplexContent::Empty | ComplexContent::SimpleContent { .. } => false,
-        ComplexContent::Sequence(particles) => {
+        ComplexContent::Sequence(particles) | ComplexContent::All(particles) => {
             matches_later_particle(doc, child, particles, schema)
         }
         ComplexContent::Choice(particles) => {
@@ -2877,9 +2905,6 @@ fn matches_later_group(
                 }
             }
             false
-        }
-        ComplexContent::All(particles) => {
-            matches_later_particle(doc, child, particles, schema)
         }
     }
 }
@@ -2931,7 +2956,7 @@ fn element_matches_decl(
             None // No namespace enforcement
         }
     };
-    
+
     match expected_ns {
         Some(ref ns) => {
             // When an element_ref points to an imported namespace but the
@@ -2958,11 +2983,9 @@ fn element_matches_decl(
     }
 }
 
-/// Resolves the namespace URI for an element referenced by QName.
+/// Resolves the namespace URI for an element referenced by `QName`.
 fn resolve_element_namespace(ref_qname: &str, schema: &XsdSchema) -> Option<String> {
-    let (ns_prefix, local) = if let Some((p, l)) = ref_qname.split_once(':') {
-        (p, l)
-    } else {
+    let Some((ns_prefix, local)) = ref_qname.split_once(':') else {
         return schema.target_namespace.clone();
     };
     // Look up prefix in the main schema's prefix map
@@ -3040,15 +3063,15 @@ fn validate_sequence_element(
         // differ from the schema declaration; we need the instance element's
         // own type for correct content validation.
         let child_name = doc.node_name(child).unwrap_or("");
-        let effective_decl = if child_name != decl.name {
+        let effective_decl = if child_name == decl.name {
+            decl
+        } else {
             schema
                 .elements
                 .get(child_name)
                 .map(|d| d as &XsdElement)
                 .or_else(|| find_root_element_in_imports(child_name, schema))
                 .unwrap_or(decl)
-        } else {
-            decl
         };
         validate_element(doc, child, effective_decl, schema, errors);
         count += 1;
@@ -3102,7 +3125,7 @@ fn validate_any_wildcard(
     any: &XsdAny,
     parent_name: &str,
     schema: &XsdSchema,
-    _errors: &mut Vec<ValidationError>,
+    errors: &mut Vec<ValidationError>,
 ) -> usize {
     let target_ns = schema.target_namespace.as_deref().unwrap_or("");
     let mut count: u32 = 0;
@@ -3115,8 +3138,8 @@ fn validate_any_wildcard(
             XsdAnyNamespace::Other => child_ns != target_ns,
             XsdAnyNamespace::List(ns_list) => {
                 ns_list.iter().any(|ns| child_ns == ns.as_str())
-                    || (ns_list.iter().any(|ns| ns == "##targetNamespace" ) && child_ns == target_ns)
-                    || (ns_list.iter().any(|ns| ns == "##local" ) && child_ns.is_empty())
+                    || (ns_list.iter().any(|ns| ns == "##targetNamespace") && child_ns == target_ns)
+                    || (ns_list.iter().any(|ns| ns == "##local") && child_ns.is_empty())
             }
         };
 
@@ -3135,12 +3158,8 @@ fn validate_any_wildcard(
         // but for now accept it (strict validation of xsd:any is
         // complex and requires cross-schema element resolution)
         match any.process_contents {
-            XsdProcessContents::Skip | XsdProcessContents::Lax => {
+            XsdProcessContents::Skip | XsdProcessContents::Lax | XsdProcessContents::Strict => {
                 // Accept without validation
-            }
-            XsdProcessContents::Strict => {
-                // Try to find and validate the element declaration
-                // For now, accept (same as lax for cross-namespace elements)
             }
         }
 
@@ -3149,7 +3168,7 @@ fn validate_any_wildcard(
     }
 
     if count < any.min_occurs {
-        _errors.push(ValidationError {
+        errors.push(ValidationError {
             message: format!(
                 "element <{parent_name}> requires at least {} wildcard element(s), found {count}",
                 any.min_occurs
@@ -3203,20 +3222,32 @@ fn validate_choice(
                 // content model (handles sequences/choices nested in choice)
                 match ct {
                     ComplexContent::Sequence(seq_particles) => {
-                        if let Some(first_particle) = seq_particles.first() {
-                            if let XsdParticle::Element(decl) = first_particle {
-                                if element_matches_decl(doc, first, decl, schema) {
-                                    // Validate the entire sequence against children
-                                    validate_sequence(doc, children, seq_particles, parent_name, schema, errors);
-                                    return true;
-                                }
+                        if let Some(XsdParticle::Element(decl)) = seq_particles.first() {
+                            if element_matches_decl(doc, first, decl, schema) {
+                                // Validate the entire sequence against children
+                                validate_sequence(
+                                    doc,
+                                    children,
+                                    seq_particles,
+                                    parent_name,
+                                    schema,
+                                    errors,
+                                );
+                                return true;
                             }
                         }
                     }
                     ComplexContent::Choice(choice_particles) => {
                         // Recurse: try to match child against choice alternatives
                         let mut sub_errors = Vec::new();
-                        validate_choice(doc, children, choice_particles, parent_name, schema, &mut sub_errors);
+                        validate_choice(
+                            doc,
+                            children,
+                            choice_particles,
+                            parent_name,
+                            schema,
+                            &mut sub_errors,
+                        );
                         if sub_errors.is_empty() {
                             return true;
                         }
@@ -4046,7 +4077,7 @@ fn count_fraction_digits(value: &str) -> usize {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::items_after_statements)]
 mod tests {
     use super::*;
 
@@ -5418,12 +5449,13 @@ mod tests {
         .unwrap();
 
         // "dog" should be accepted where "pet" is expected
-        let doc = Document::parse_str(
-            r#"<pets><dog>Rex</dog><cat>Mimi</cat></pets>"#,
-        )
-        .unwrap();
+        let doc = Document::parse_str(r"<pets><dog>Rex</dog><cat>Mimi</cat></pets>").unwrap();
         let result = validate_xsd(&doc, &schema);
-        assert!(result.is_valid, "substitution members should be valid: {:?}", result.errors);
+        assert!(
+            result.is_valid,
+            "substitution members should be valid: {:?}",
+            result.errors
+        );
     }
 
     /// Schema with transitive substitution: `poodle → dog → pet`.
@@ -5445,12 +5477,13 @@ mod tests {
         .unwrap();
 
         // "poodle" is a transitive substitute for "pet" (via "dog")
-        let doc = Document::parse_str(
-            r#"<kennel><poodle>Fifi</poodle></kennel>"#,
-        )
-        .unwrap();
+        let doc = Document::parse_str(r"<kennel><poodle>Fifi</poodle></kennel>").unwrap();
         let result = validate_xsd(&doc, &schema);
-        assert!(result.is_valid, "transitive substitution should be valid: {:?}", result.errors);
+        assert!(
+            result.is_valid,
+            "transitive substitution should be valid: {:?}",
+            result.errors
+        );
     }
 
     /// Verify substitution group index is built correctly.
@@ -5472,8 +5505,8 @@ mod tests {
         .unwrap();
 
         // "derived1" and "derived2" should both substitute for "base"
-        let doc1 = Document::parse_str(r#"<root><derived1>hello</derived1></root>"#).unwrap();
-        let doc2 = Document::parse_str(r#"<root><derived2>world</derived2></root>"#).unwrap();
+        let doc1 = Document::parse_str(r"<root><derived1>hello</derived1></root>").unwrap();
+        let doc2 = Document::parse_str(r"<root><derived2>world</derived2></root>").unwrap();
         assert!(validate_xsd(&doc1, &schema).is_valid);
         assert!(validate_xsd(&doc2, &schema).is_valid);
     }
@@ -5496,7 +5529,7 @@ mod tests {
         .unwrap();
 
         // "unknown" is NOT a substitution group member
-        let doc = Document::parse_str(r#"<root><unknown>oops</unknown></root>"#).unwrap();
+        let doc = Document::parse_str(r"<root><unknown>oops</unknown></root>").unwrap();
         let result = validate_xsd(&doc, &schema);
         assert!(!result.is_valid, "non-member should be rejected");
     }
@@ -5528,7 +5561,11 @@ mod tests {
         // Correct order: a, b (base), then c (extension)
         let doc = Document::parse_str("<root><a>1</a><b>2</b><c>3</c></root>").unwrap();
         let result = validate_xsd(&doc, &schema);
-        assert!(result.is_valid, "correct order, errors: {:?}", result.errors);
+        assert!(
+            result.is_valid,
+            "correct order, errors: {:?}",
+            result.errors
+        );
 
         // Wrong order: c before b
         let doc = Document::parse_str("<root><a>1</a><c>3</c><b>2</b></root>").unwrap();
@@ -5575,7 +5612,11 @@ mod tests {
 
         let doc = Document::parse_str("<root><a>1</a><b>2</b><c>3</c></root>").unwrap();
         let result = validate_xsd(&doc, &schema);
-        assert!(result.is_valid, "3-level chain, errors: {:?}", result.errors);
+        assert!(
+            result.is_valid,
+            "3-level chain, errors: {:?}",
+            result.errors
+        );
     }
 
     #[test]
@@ -5599,7 +5640,11 @@ mod tests {
 
         let doc = Document::parse_str("<root><x>hello</x></root>").unwrap();
         let result = validate_xsd(&doc, &schema);
-        assert!(result.is_valid, "empty base extension, errors: {:?}", result.errors);
+        assert!(
+            result.is_valid,
+            "empty base extension, errors: {:?}",
+            result.errors
+        );
     }
 }
 
@@ -5639,9 +5684,13 @@ fn test_complex_content_extension_with_target_namespace() {
     )
     .unwrap();
     let result = validate_xsd(&doc, &schema);
-    assert!(result.is_valid, "correct order, errors: {:?}", result.errors);
+    assert!(
+        result.is_valid,
+        "correct order, errors: {:?}",
+        result.errors
+    );
 
-    // Wrong order: b before a  
+    // Wrong order: b before a
     let doc = Document::parse_str(
         r#"<adv:root xmlns:adv="http://adv.example.com">
             <adv:b>2</adv:b><adv:a>1</adv:a><adv:c>3</adv:c>
@@ -5683,14 +5732,17 @@ fn test_sequence_optional_element_wrong_position() {
     .unwrap();
     let result = validate_xsd(&doc, &schema);
     eprintln!("Errors: {:?}", result.errors);
-    assert!(!result.is_valid, "optional before required should be invalid");
+    assert!(
+        !result.is_valid,
+        "optional before required should be invalid"
+    );
 }
 
-    #[test]
-    fn test_sequence_order_violation() {
-        // Schema: sequence with optional element between two required ones
-        let schema = parse_xsd(
-            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+#[test]
+fn test_sequence_order_violation() {
+    // Schema: sequence with optional element between two required ones
+    let schema = parse_xsd(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
                 <xs:element name="root">
                     <xs:complexType><xs:sequence>
                         <xs:element name="a" type="xs:string"/>
@@ -5699,37 +5751,55 @@ fn test_sequence_optional_element_wrong_position() {
                     </xs:sequence></xs:complexType>
                 </xs:element>
             </xs:schema>"#,
-        )
-        .unwrap();
+    )
+    .unwrap();
 
-        // Valid: a, b, c in order
-        let doc_ok = Document::parse_str("<root><a>1</a><b>2</b><c>3</c></root>").unwrap();
-        let result_ok = validate_xsd(&doc_ok, &schema);
-        assert!(result_ok.is_valid, "a,b,c should be valid: {:?}", result_ok.errors);
+    // Valid: a, b, c in order
+    let doc_ok = Document::parse_str("<root><a>1</a><b>2</b><c>3</c></root>").unwrap();
+    let result_ok = validate_xsd(&doc_ok, &schema);
+    assert!(
+        result_ok.is_valid,
+        "a,b,c should be valid: {:?}",
+        result_ok.errors
+    );
 
-        // Valid: a, c (b optional, skipped)
-        let doc_ok2 = Document::parse_str("<root><a>1</a><c>3</c></root>").unwrap();
-        let result_ok2 = validate_xsd(&doc_ok2, &schema);
-        assert!(result_ok2.is_valid, "a,c should be valid (b optional): {:?}", result_ok2.errors);
+    // Valid: a, c (b optional, skipped)
+    let doc_ok2 = Document::parse_str("<root><a>1</a><c>3</c></root>").unwrap();
+    let result_ok2 = validate_xsd(&doc_ok2, &schema);
+    assert!(
+        result_ok2.is_valid,
+        "a,c should be valid (b optional): {:?}",
+        result_ok2.errors
+    );
 
-        // Invalid: c, a, b — c appears before a
-        let doc_bad = Document::parse_str("<root><c>3</c><a>1</a><b>2</b></root>").unwrap();
-        let result_bad = validate_xsd(&doc_bad, &schema);
-        assert!(!result_bad.is_valid, "c before a should be invalid");
-        assert!(result_bad.errors.iter().any(|e| e.message.contains("unexpected")),
-            "should report ordering error: {:?}", result_bad.errors);
-    }
+    // Invalid: c, a, b — c appears before a
+    let doc_bad = Document::parse_str("<root><c>3</c><a>1</a><b>2</b></root>").unwrap();
+    let result_bad = validate_xsd(&doc_bad, &schema);
+    assert!(!result_bad.is_valid, "c before a should be invalid");
+    assert!(
+        result_bad
+            .errors
+            .iter()
+            .any(|e| e.message.contains("unexpected")),
+        "should report ordering error: {:?}",
+        result_bad.errors
+    );
+}
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn test_nas_substitution_group_resolution() {
-    let schema_dir = std::path::Path::new("/Users/aw/Repository-CISS/konverter2.0/konverter/SCHEMA");
+    let schema_dir =
+        std::path::Path::new("/Users/aw/Repository-CISS/konverter2.0/konverter/SCHEMA");
     if !schema_dir.exists() {
         eprintln!("Skipping NAS test - schema dir not found");
         return;
     }
-    let entry = std::path::Path::new("/Users/aw/Repository-CISS/konverter2.0/konverter/SCHEMA/NAS-Operationen.xsd");
-    let xml = std::fs::read_to_string(&entry).unwrap();
-    let doc = Document::parse_str(&xml).unwrap();
+    let entry = std::path::Path::new(
+        "/Users/aw/Repository-CISS/konverter2.0/konverter/SCHEMA/NAS-Operationen.xsd",
+    );
+    let xml = std::fs::read_to_string(entry).unwrap();
+    let _doc = Document::parse_str(&xml).unwrap();
     // Local resolver that maps import URLs to local SCHEMA/ directory files
     struct NasResolver {
         schema_dir: std::path::PathBuf,
@@ -5738,17 +5808,19 @@ fn test_nas_substitution_group_resolution() {
         fn resolve(&self, location: &str, _base: Option<&str>) -> Option<String> {
             let filename = location.rsplit('/').next().unwrap_or(location);
             let local_path = self.schema_dir.join(filename);
-            std::fs::read_to_string(&local_path).ok()
+            std::fs::read_to_string(local_path).ok()
         }
     }
-    let resolver = NasResolver { schema_dir: schema_dir.to_path_buf() };
+    let resolver = NasResolver {
+        schema_dir: schema_dir.to_path_buf(),
+    };
 
     let options = XsdParseOptions {
         resolver: Some(&resolver),
         base_uri: schema_dir.to_str().map(String::from),
     };
     let schema = parse_xsd_with_options(&xml, &options).unwrap();
-    
+
     // Debug: print FeatureCollectionType particles
     if let Some(XsdType::Complex(ct)) = schema.types.get("FeatureCollectionType") {
         eprintln!("\nFeatureCollectionType content:");
@@ -5756,74 +5828,90 @@ fn test_nas_substitution_group_resolution() {
             ComplexContent::Sequence(particles) => {
                 for p in particles {
                     match p {
-                        XsdParticle::Element(e) => eprintln!("  element: name={} ref={:?}", e.name, e.element_ref),
-                        XsdParticle::Group(g) => eprintln!("  group: {:?}", g),
+                        XsdParticle::Element(e) => {
+                            eprintln!("  element: name={} ref={:?}", e.name, e.element_ref)
+                        }
+                        XsdParticle::Group(g) => eprintln!("  group: {g:?}"),
                         XsdParticle::Any(_) => eprintln!("  <any>"),
                     }
                 }
             }
-            other => eprintln!("  {:?}", other),
+            other => eprintln!("  {other:?}"),
         }
     }
     // Also check imported types
     for (ns, imp) in &schema.imported_namespaces {
         if let Some(XsdType::Complex(ct)) = imp.types.get("FeatureCollectionType") {
-            eprintln!("\nIMPORTED FeatureCollectionType [{}] content:", ns);
+            eprintln!("\nIMPORTED FeatureCollectionType [{ns}] content:");
             match &ct.content {
                 ComplexContent::Sequence(particles) => {
                     for p in particles {
                         match p {
-                            XsdParticle::Element(e) => eprintln!("  element: name={} ref={:?}", e.name, e.element_ref),
-                            XsdParticle::Group(g) => eprintln!("  group: {:?}", g),
+                            XsdParticle::Element(e) => {
+                                eprintln!("  element: name={} ref={:?}", e.name, e.element_ref)
+                            }
+                            XsdParticle::Group(g) => eprintln!("  group: {g:?}"),
                             XsdParticle::Any(_) => eprintln!("  <any>"),
                         }
                     }
                 }
-                other => eprintln!("  {:?}", other),
+                other => eprintln!("  {other:?}"),
             }
         }
     }
 
     // Debug: print substitution groups
-    eprintln!("Substitution groups (count={}):", schema.substitution_groups.len());
+    eprintln!(
+        "Substitution groups (count={}):",
+        schema.substitution_groups.len()
+    );
     for (head, members) in &schema.substitution_groups {
         if head.contains("FeatureCollection") || head.contains("Abstract") {
-            eprintln!("  {} -> {:?}", head, members);
+            eprintln!("  {head} -> {members:?}");
         }
     }
-    
+
     // Debug: FeatureCollection elements
     eprintln!("\nFeatureCollection elements:");
     for (name, elem) in &schema.elements {
         if name.contains("FeatureCollection") {
-            eprintln!("  LOCAL {} -> sub_group={:?} abstract={}", name, elem.substitution_group, elem.is_abstract);
+            eprintln!(
+                "  LOCAL {name} -> sub_group={:?} abstract={}",
+                elem.substitution_group, elem.is_abstract
+            );
         }
     }
     for (ns, imp) in &schema.imported_namespaces {
         for (name, elem) in &imp.elements {
             if name.contains("FeatureCollection") {
-                eprintln!("  IMPORTED[{}] {} -> sub_group={:?} abstract={}", ns, name, elem.substitution_group, elem.is_abstract);
+                eprintln!(
+                    "  IMPORTED[{ns}] {name} -> sub_group={:?} abstract={}",
+                    elem.substitution_group, elem.is_abstract
+                );
             }
         }
     }
-    
+
     // Debug: AbstractCRS elements
     eprintln!("\nAbstractCRS elements:");
     for (name, elem) in &schema.elements {
         if name.contains("AbstractCRS") {
-            eprintln!("  LOCAL {} -> sub_group={:?} abstract={}", name, elem.substitution_group, elem.is_abstract);
+            eprintln!(
+                "  LOCAL {name} -> sub_group={:?} abstract={}",
+                elem.substitution_group, elem.is_abstract
+            );
         }
     }
     eprintln!("\nAll imported namespaces:");
     for (ns, imp) in &schema.imported_namespaces {
-        eprintln!("  {} ({} elements)", ns, imp.elements.len());
+        eprintln!("  {ns} ({} elements)", imp.elements.len());
         for name in imp.elements.keys() {
             if name.contains("Feature") || name.contains("CRS") || name.contains("Abstract") {
-                eprintln!("    {}", name);
+                eprintln!("    {name}");
             }
         }
     }
-    
+
     // Now validate the actual NAS file
     let nas_file = "/Users/aw/Repository-CISS/konverter2.0/konverter/tests/assets/NAS/BE/auftragsposition_1_NAS_AMGR000000868064_1_.xml";
     if !std::path::Path::new(nas_file).exists() {
@@ -5842,15 +5930,28 @@ fn test_nas_substitution_group_resolution() {
     // - boundedBy in FeatureCollection (GML boundedBy support)
     // Serializer errors (antragsnummer, allgemeineAngaben, etc.) are expected
     // until the serializer is fixed.
-    let non_serializer_errors: Vec<_> = result.errors.iter()
-        .filter(|e| !e.message.contains("<antragsnummer>") && !e.message.contains("<allgemeineAngaben>") && !e.message.contains("<erlaeuterung>"))
+    let non_serializer_errors: Vec<_> = result
+        .errors
+        .iter()
+        .filter(|e| {
+            !e.message.contains("<antragsnummer>")
+                && !e.message.contains("<allgemeineAngaben>")
+                && !e.message.contains("<erlaeuterung>")
+        })
         .collect();
-    eprintln!("Non-serializer errors: {}/{}", non_serializer_errors.len(), result.errors.len());
+    eprintln!(
+        "Non-serializer errors: {}/{}",
+        non_serializer_errors.len(),
+        result.errors.len()
+    );
     // FeatureCollection substitution group should be resolved now
-    assert!(!result.errors.iter().any(|e| 
-        e.message.contains("requires at least 1 occurrence(s) of <FeatureCollection>") ||
-        e.message.contains("unexpected element <FeatureCollection>")),
-        "FeatureCollection substitution group should be resolved");
+    assert!(
+        !result.errors.iter().any(|e| e
+            .message
+            .contains("requires at least 1 occurrence(s) of <FeatureCollection>")
+            || e.message.contains("unexpected element <FeatureCollection>")),
+        "FeatureCollection substitution group should be resolved"
+    );
 }
 
 /// Test that root elements declared in imported schemas are found.
@@ -5859,7 +5960,8 @@ fn test_nas_substitution_group_resolution() {
 /// `NAS-Operationen.xsd` (imported by `AAA-Basisschema.xsd`).
 #[test]
 fn test_root_element_from_imported_schema() {
-    let schema_dir = std::path::Path::new("/Users/aw/Repository-CISS/konverter2.0/konverter/SCHEMA");
+    let schema_dir =
+        std::path::Path::new("/Users/aw/Repository-CISS/konverter2.0/konverter/SCHEMA");
     let entry = schema_dir.join("AAA-Basisschema.xsd");
     if !entry.exists() {
         eprintln!("Skipping test - AAA-Basisschema.xsd not found");
@@ -5904,8 +6006,11 @@ fn test_root_element_from_imported_schema() {
 
     // Should NOT report "not declared as a global element"
     // If this fails, root element lookup in imported schemas is broken.
-    assert!(!result.errors.iter().any(|e|
-        e.message.contains("not declared as a global element")),
+    assert!(
+        !result
+            .errors
+            .iter()
+            .any(|e| e.message.contains("not declared as a global element")),
         "AX_Bestandsdatenauszug should be found: {:?}",
         result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
     );
@@ -5934,8 +6039,11 @@ fn test_root_element_from_imported_schema() {
 </AX_Bestandsdatenauszug>"#;
     let doc_bad = Document::parse_str(std::str::from_utf8(xml_bad).unwrap()).unwrap();
     let result_bad = validate_xsd(&doc_bad, &schema);
-    assert!(!result_bad.is_valid,
-        "wrong element order should be detected: {:?}", result_bad.errors);
+    assert!(
+        !result_bad.is_valid,
+        "wrong element order should be detected: {:?}",
+        result_bad.errors
+    );
 }
 
 /// Test that compositor-level minOccurs propagates to child elements.
@@ -5961,7 +6069,7 @@ fn test_compositor_min_occurs_propagation() {
     .unwrap();
 
     // "a" is required, "b" is inside an optional sequence
-    let doc = Document::parse_str(r#"<root><a>hello</a></root>"#).unwrap();
+    let doc = Document::parse_str(r"<root><a>hello</a></root>").unwrap();
     let result = validate_xsd(&doc, &schema);
     assert!(
         result.is_valid,
@@ -5970,7 +6078,7 @@ fn test_compositor_min_occurs_propagation() {
     );
 
     // But "a" IS required
-    let doc_missing_a = Document::parse_str(r#"<root><b>hello</b></root>"#).unwrap();
+    let doc_missing_a = Document::parse_str(r"<root><b>hello</b></root>").unwrap();
     let result_a = validate_xsd(&doc_missing_a, &schema);
     assert!(!result_a.is_valid, "'a' should be required");
 }
@@ -6059,7 +6167,10 @@ mod test_envelope_lowercorner {
         )
         .unwrap();
         let result = validate_xsd(&doc, &schema);
-        assert!(result.is_valid, "lowerCorner/upperCorner should be valid: {:?}", result.errors);
+        assert!(
+            result.is_valid,
+            "lowerCorner/upperCorner should be valid: {:?}",
+            result.errors
+        );
     }
 }
-
