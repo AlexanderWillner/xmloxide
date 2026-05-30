@@ -118,6 +118,8 @@ pub struct XsdSchema {
     pub types: HashMap<String, XsdType>,
     /// Named attribute groups, keyed by group name.
     pub attribute_groups: HashMap<String, Vec<XsdAttribute>>,
+    /// Named model groups (`<xsd:group name="...">`).
+    pub model_groups: HashMap<String, ComplexContent>,
     /// Imported schemas from other namespaces, keyed by namespace URI.
     pub imported_namespaces: HashMap<String, ImportedSchema>,
     /// Prefix-to-namespace-URI map from the root schema element.
@@ -150,6 +152,10 @@ pub struct ImportedSchema {
     pub types: HashMap<String, XsdType>,
     /// Named attribute groups from the imported namespace.
     pub attribute_groups: HashMap<String, Vec<XsdAttribute>>,
+    /// Named model groups from the imported namespace.
+    pub model_groups: HashMap<String, ComplexContent>,
+    /// XML namespace prefix→URI mappings from this schema document.
+    pub prefix_map: HashMap<String, String>,
 }
 
 /// An element declaration in the schema.
@@ -511,6 +517,7 @@ pub fn parse_xsd_with_options(
         elements: HashMap::new(),
         types: HashMap::new(),
         attribute_groups: HashMap::new(),
+        model_groups: HashMap::new(),
         imported_namespaces: HashMap::new(),
         prefix_map,
         element_form_default,
@@ -586,6 +593,24 @@ fn parse_top_level_declarations(
     loaded: &mut HashSet<String>,
     this_ns: Option<&String>,
 ) -> Result<(), ValidationError> {
+    // Pass 1: collect named model groups so type parsing can resolve <group ref="...">
+    for child in doc.children(root) {
+        if doc.node_name(child) != Some("group") {
+            continue;
+        }
+        let Some(group_name) = doc.attribute(child, "name") else {
+            continue;
+        };
+        if let Some(group_content) = parse_named_group(doc, child, &schema.model_groups) {
+            schema
+                .model_groups
+                .insert(group_name.to_string(), group_content);
+        }
+    }
+
+    let group_defs = schema.model_groups.clone();
+
+    // Pass 2: parse all regular top-level declarations
     for child in doc.children(root) {
         let Some(name) = doc.node_name(child) else {
             continue;
@@ -597,7 +622,7 @@ fn parse_top_level_declarations(
                 }
             }
             "complexType" => {
-                let ct = parse_complex_type(doc, child);
+                let ct = parse_complex_type(doc, child, &group_defs);
                 if let Some(ref type_name) = ct.name {
                     schema.types.insert(type_name.clone(), XsdType::Complex(ct));
                 }
@@ -695,6 +720,14 @@ fn handle_include(
     // Mark as loaded before recursing to prevent cycles
     loaded.insert(location.to_string());
 
+    // Merge prefix declarations from the included schema so that
+    // QName resolution (e.g., gmd:LI_Lineage) works for types and
+    // elements declared in imported-but-not-included namespaces.
+    let included_prefix_map = build_prefix_map(&included_doc, included_root);
+    for (prefix, uri) in included_prefix_map {
+        schema.prefix_map.entry(prefix).or_insert(uri);
+    }
+
     // Parse and merge the included schema's declarations
     parse_xsd_internal(&content, options, loaded, schema)?;
 
@@ -788,6 +821,8 @@ fn handle_import(
         elements: HashMap::new(),
         types: HashMap::new(),
         attribute_groups: HashMap::new(),
+        model_groups: HashMap::new(),
+        prefix_map: HashMap::new(),
     };
 
     // We need a temporary XsdSchema to parse into, then extract declarations
@@ -800,6 +835,7 @@ fn handle_import(
         elements: HashMap::new(),
         types: HashMap::new(),
         attribute_groups: HashMap::new(),
+        model_groups: HashMap::new(),
         imported_namespaces: HashMap::new(),
         prefix_map: build_prefix_map(&imported_doc, imported_root),
         element_form_default: imported_form_default,
@@ -826,6 +862,8 @@ fn handle_import(
     }
     imported.elements = temp_schema.elements;
     imported.attribute_groups = temp_schema.attribute_groups;
+    imported.model_groups = temp_schema.model_groups;
+    imported.prefix_map = temp_schema.prefix_map;
 
     // Also merge any transitive imports
     for (k, v) in temp_schema.imported_namespaces {
@@ -987,13 +1025,15 @@ fn merge_extension_bases(schema: &mut XsdSchema) {
     }
 
     // Imported namespace extensions
-    let imported_extensions: Vec<(String, String)> = schema
+    let imported_extensions: Vec<(String, String, String)> = schema
         .imported_namespaces
-        .values()
-        .flat_map(|imp| {
+        .iter()
+        .flat_map(|(ns, imp)| {
             imp.types.iter().filter_map(|(name, ty)| {
                 if let XsdType::Complex(ct) = ty {
-                    ct.extension_base.as_ref().map(|base| (name.clone(), base.clone()))
+                    ct.extension_base
+                        .as_ref()
+                        .map(|base| (ns.clone(), name.clone(), base.clone()))
                 } else {
                     None
                 }
@@ -1001,12 +1041,14 @@ fn merge_extension_bases(schema: &mut XsdSchema) {
         })
         .collect();
 
-    for (type_name, base_name) in imported_extensions {
+    for (ns, type_name, base_name) in imported_extensions {
         let base_particles = resolve_base_particles(&base_name, schema);
         let base_attrs = resolve_base_attributes(&base_name, schema);
-        if base_particles.is_empty() && base_attrs.is_empty() { continue; }
-        for imp in schema.imported_namespaces.values_mut() {
-            merge_type_extension(&mut imp.types, &type_name, base_particles.clone(), base_attrs.clone());
+        if base_particles.is_empty() && base_attrs.is_empty() {
+            continue;
+        }
+        if let Some(imp) = schema.imported_namespaces.get_mut(&ns) {
+            merge_type_extension(&mut imp.types, &type_name, base_particles, base_attrs);
         }
     }
 }
@@ -1304,7 +1346,13 @@ fn find_inline_type(doc: &Document, node: NodeId) -> Option<XsdType> {
             continue;
         };
         match child_name {
-            "complexType" => return Some(XsdType::Complex(parse_complex_type(doc, child))),
+            "complexType" => {
+                return Some(XsdType::Complex(parse_complex_type(
+                    doc,
+                    child,
+                    &HashMap::new(),
+                )))
+            }
             "simpleType" => {
                 return Some(XsdType::Simple(parse_simple_type(doc, child)));
             }
@@ -1315,7 +1363,11 @@ fn find_inline_type(doc: &Document, node: NodeId) -> Option<XsdType> {
 }
 
 /// Parses an `<xs:complexType>` element.
-fn parse_complex_type(doc: &Document, node: NodeId) -> ComplexType {
+fn parse_complex_type(
+    doc: &Document,
+    node: NodeId,
+    group_defs: &HashMap<String, ComplexContent>,
+) -> ComplexType {
     let name = doc.attribute(node, "name").map(String::from);
     let mixed = doc.attribute(node, "mixed") == Some("true");
     let mut content = ComplexContent::Empty;
@@ -1327,9 +1379,11 @@ fn parse_complex_type(doc: &Document, node: NodeId) -> ComplexType {
             continue;
         };
         match child_name {
-            "sequence" => content = parse_compositor(doc, child, CompositorKind::Sequence),
-            "choice" => content = parse_compositor(doc, child, CompositorKind::Choice),
-            "all" => content = parse_compositor(doc, child, CompositorKind::All),
+            "sequence" => {
+                content = parse_compositor(doc, child, CompositorKind::Sequence, group_defs)
+            }
+            "choice" => content = parse_compositor(doc, child, CompositorKind::Choice, group_defs),
+            "all" => content = parse_compositor(doc, child, CompositorKind::All, group_defs),
             "attribute" => {
                 if let Some(attr) = parse_attribute_decl(doc, child) {
                     attributes.push(attr);
@@ -1355,7 +1409,7 @@ fn parse_complex_type(doc: &Document, node: NodeId) -> ComplexType {
                 collect_simple_content_attributes(doc, child, &mut attributes);
             }
             "complexContent" => {
-                let (base, ct, ext_attrs) = parse_complex_content(doc, child);
+                let (base, ct, ext_attrs) = parse_complex_content(doc, child, group_defs);
                 extension_base = base;
                 content = ct;
                 attributes.extend(ext_attrs);
@@ -1380,6 +1434,7 @@ fn parse_complex_type(doc: &Document, node: NodeId) -> ComplexType {
 fn parse_complex_content(
     doc: &Document,
     cc_node: NodeId,
+    group_defs: &HashMap<String, ComplexContent>,
 ) -> (Option<String>, ComplexContent, Vec<XsdAttribute>) {
     let mut base = None;
     let mut content = ComplexContent::Empty;
@@ -1394,15 +1449,24 @@ fn parse_complex_content(
                     let Some(ext_name) = doc.node_name(ext_child) else { continue };
                     match ext_name {
                         "sequence" => {
-                            content =
-                                parse_compositor(doc, ext_child, CompositorKind::Sequence)
+                            content = parse_compositor(
+                                doc,
+                                ext_child,
+                                CompositorKind::Sequence,
+                                group_defs,
+                            )
                         }
                         "choice" => {
-                            content =
-                                parse_compositor(doc, ext_child, CompositorKind::Choice)
+                            content = parse_compositor(
+                                doc,
+                                ext_child,
+                                CompositorKind::Choice,
+                                group_defs,
+                            )
                         }
                         "all" => {
-                            content = parse_compositor(doc, ext_child, CompositorKind::All)
+                            content =
+                                parse_compositor(doc, ext_child, CompositorKind::All, group_defs)
                         }
                         "attribute" => {
                             if let Some(attr) = parse_attribute_decl(doc, ext_child) {
@@ -1435,16 +1499,28 @@ fn parse_complex_content(
                     let Some(restr_name) = doc.node_name(restr_child) else { continue };
                     match restr_name {
                         "sequence" => {
-                            content =
-                                parse_compositor(doc, restr_child, CompositorKind::Sequence)
+                            content = parse_compositor(
+                                doc,
+                                restr_child,
+                                CompositorKind::Sequence,
+                                group_defs,
+                            )
                         }
                         "choice" => {
-                            content =
-                                parse_compositor(doc, restr_child, CompositorKind::Choice)
+                            content = parse_compositor(
+                                doc,
+                                restr_child,
+                                CompositorKind::Choice,
+                                group_defs,
+                            )
                         }
                         "all" => {
-                            content =
-                                parse_compositor(doc, restr_child, CompositorKind::All)
+                            content = parse_compositor(
+                                doc,
+                                restr_child,
+                                CompositorKind::All,
+                                group_defs,
+                            )
                         }
                         "attribute" => {
                             if let Some(attr) = parse_attribute_decl(doc, restr_child) {
@@ -1485,13 +1561,32 @@ fn collect_simple_content_attributes(
     attributes: &mut Vec<XsdAttribute>,
 ) {
     for sc_child in doc.children(sc_node) {
-        if doc.node_name(sc_child) == Some("extension") {
-            for ext_child in doc.children(sc_child) {
-                if doc.node_name(ext_child) == Some("attribute") {
+        if !matches!(doc.node_name(sc_child), Some("extension" | "restriction")) {
+            continue;
+        }
+        for ext_child in doc.children(sc_child) {
+            match doc.node_name(ext_child) {
+                Some("attribute") => {
                     if let Some(attr) = parse_attribute_decl(doc, ext_child) {
                         attributes.push(attr);
                     }
                 }
+                Some("attributeGroup") => {
+                    if let Some(ref_name) = doc.attribute(ext_child, "ref") {
+                        let local = if let Some((_, l)) = ref_name.split_once(':') {
+                            l.to_string()
+                        } else {
+                            ref_name.to_string()
+                        };
+                        attributes.push(XsdAttribute {
+                            name: local,
+                            type_ref: "__attr_group__".to_string(),
+                            required: false,
+                            fixed: None,
+                        });
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -1505,13 +1600,67 @@ enum CompositorKind {
     All,
 }
 
+/// Parses top-level `<xsd:group name="...">` declarations.
+fn parse_named_group(
+    doc: &Document,
+    node: NodeId,
+    group_defs: &HashMap<String, ComplexContent>,
+) -> Option<ComplexContent> {
+    for child in doc.children(node) {
+        let Some(name) = doc.node_name(child) else {
+            continue;
+        };
+        match name {
+            "sequence" => {
+                return Some(parse_compositor(
+                    doc,
+                    child,
+                    CompositorKind::Sequence,
+                    group_defs,
+                ));
+            }
+            "choice" => {
+                return Some(parse_compositor(
+                    doc,
+                    child,
+                    CompositorKind::Choice,
+                    group_defs,
+                ));
+            }
+            "all" => {
+                return Some(parse_compositor(
+                    doc,
+                    child,
+                    CompositorKind::All,
+                    group_defs,
+                ));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Parses a compositor (`<xs:sequence>`, `<xs:choice>`, or `<xs:all>`).
-fn parse_compositor(doc: &Document, node: NodeId, kind: CompositorKind) -> ComplexContent {
+fn parse_compositor(
+    doc: &Document,
+    node: NodeId,
+    kind: CompositorKind,
+    group_defs: &HashMap<String, ComplexContent>,
+) -> ComplexContent {
     let mut particles = Vec::new();
     // Read compositor-level minOccurs/maxOccurs.
     // XSD 1.0: these apply to the group as a whole.
     // When minOccurs=0, all direct element children become effectively optional.
     let compositor_min = parse_min_occurs(doc, node);
+    let compositor_max = doc.attribute(node, "maxOccurs").map_or(MaxOccurs::Bounded(1), |v| {
+        if v == "unbounded" {
+            MaxOccurs::Unbounded
+        } else {
+            MaxOccurs::Bounded(v.parse::<u32>().unwrap_or(1))
+        }
+    });
+
     for child in doc.children(node) {
         let Some(child_name) = doc.node_name(child) else {
             continue;
@@ -1533,6 +1682,7 @@ fn parse_compositor(doc: &Document, node: NodeId, kind: CompositorKind) -> Compl
                     doc,
                     child,
                     CompositorKind::Sequence,
+                    group_defs,
                 )));
             }
             "choice" => {
@@ -1540,6 +1690,7 @@ fn parse_compositor(doc: &Document, node: NodeId, kind: CompositorKind) -> Compl
                     doc,
                     child,
                     CompositorKind::Choice,
+                    group_defs,
                 )));
             }
             "all" => {
@@ -1547,7 +1698,20 @@ fn parse_compositor(doc: &Document, node: NodeId, kind: CompositorKind) -> Compl
                     doc,
                     child,
                     CompositorKind::All,
+                    group_defs,
                 )));
+            }
+            "group" => {
+                if let Some(ref_qname) = doc.attribute(child, "ref") {
+                    let local = if let Some((_, l)) = ref_qname.split_once(':') {
+                        l
+                    } else {
+                        ref_qname
+                    };
+                    if let Some(group_content) = group_defs.get(local) {
+                        particles.push(XsdParticle::Group(group_content.clone()));
+                    }
+                }
             }
             "any" => {
                 if let Some(any) = parse_any_wildcard(doc, child) {
@@ -1557,6 +1721,18 @@ fn parse_compositor(doc: &Document, node: NodeId, kind: CompositorKind) -> Compl
             _ => {}
         }
     }
+    // For single-element compositor groups, group maxOccurs can be safely
+    // propagated to the child element (A repeated N times == element A maxOccurs=N).
+    if particles.len() == 1 {
+        if let XsdParticle::Element(elem) = &mut particles[0] {
+            match compositor_max {
+                MaxOccurs::Unbounded => elem.max_occurs = MaxOccurs::Unbounded,
+                MaxOccurs::Bounded(n) if n > 1 => elem.max_occurs = MaxOccurs::Bounded(n),
+                _ => {}
+            }
+        }
+    }
+
     match kind {
         CompositorKind::Sequence => ComplexContent::Sequence(particles),
         CompositorKind::Choice => ComplexContent::Choice(particles),
@@ -1978,7 +2154,13 @@ fn validate_element_strict(
 ) {
     match resolve_element_type(decl, schema) {
         Some(XsdType::Complex(ct)) => {
-            validate_attributes_strict(doc, node, &ct.attributes, schema, errors);
+            let mut declared_attrs = ct.attributes.clone();
+            if let ComplexContent::SimpleContent { base } = &ct.content {
+                let mut inherited = resolve_simple_content_base_attributes(base, schema);
+                inherited.append(&mut declared_attrs);
+                declared_attrs = inherited;
+            }
+            validate_attributes_strict(doc, node, &declared_attrs, schema, errors);
             validate_complex_element_strict(doc, node, ct, schema, errors);
         }
         Some(XsdType::Simple(st)) => {
@@ -1986,17 +2168,57 @@ fn validate_element_strict(
             validate_attributes_strict(doc, node, &[], schema, errors);
         }
         None => {
-            // Type could not be resolved — in strict mode, report this
-            // but still check for unknown attributes on the element
+            // No declared type defaults to xs:anyType (valid in XSD).
+            if decl.type_ref.is_none() && decl.inline_type.is_none() && decl.element_ref.is_none() {
+                return;
+            }
+            // Otherwise this is a real unresolved-type error.
             let elem_name = doc.node_name(node).unwrap_or("<unknown>");
             errors.push(ValidationError {
-                message: format!(
-                    "element <{elem_name}> has no resolvable type declaration"
-                ),
+                message: format!("element <{elem_name}> has no resolvable type declaration"),
                 line: None,
                 column: None,
             });
         }
+    }
+}
+
+fn resolve_simple_content_base_attributes(
+    base_type: &str,
+    schema: &XsdSchema,
+) -> Vec<XsdAttribute> {
+    resolve_simple_content_base_attributes_impl(base_type, schema, &mut HashSet::new())
+}
+
+fn resolve_simple_content_base_attributes_impl(
+    base_type: &str,
+    schema: &XsdSchema,
+    visited: &mut HashSet<String>,
+) -> Vec<XsdAttribute> {
+    let local = base_type
+        .split_once(':')
+        .map(|(_, l)| l)
+        .unwrap_or(base_type)
+        .to_string();
+    if !visited.insert(local.clone()) {
+        return Vec::new();
+    }
+
+    let Some(ty) = resolve_type_name(base_type, schema).or_else(|| schema.types.get(&local)) else {
+        return Vec::new();
+    };
+
+    match ty {
+        XsdType::Complex(ct) => {
+            let mut attrs = if let ComplexContent::SimpleContent { base } = &ct.content {
+                resolve_simple_content_base_attributes_impl(base, schema, visited)
+            } else {
+                Vec::new()
+            };
+            attrs.extend(ct.attributes.clone());
+            attrs
+        }
+        XsdType::Simple(_) => Vec::new(),
     }
 }
 
@@ -2053,7 +2275,17 @@ fn validate_complex_element_strict(
         }
         ComplexContent::Sequence(p) => {
             let ce = collect_child_elements(doc, node);
-            validate_sequence_strict(doc, &ce, p, doc.node_name(node).unwrap_or("<unknown>"), schema, errors);
+            let owner_ns = doc.node_namespace(node).unwrap_or("");
+            let _ = validate_sequence_strict(
+                doc,
+                &ce,
+                p,
+                doc.node_name(node).unwrap_or("<unknown>"),
+                owner_ns,
+                schema,
+                errors,
+                true,
+            );
         }
         ComplexContent::Choice(p) => {
             let ce = collect_child_elements(doc, node);
@@ -2072,15 +2304,35 @@ fn validate_complex_element_strict(
     }
 }
 
+/// Resolve effective declaration for substitution-group matches.
+fn resolve_substitution_member_decl<'a>(
+    doc: &Document,
+    child: NodeId,
+    decl: &'a XsdElement,
+    schema: &'a XsdSchema,
+) -> &'a XsdElement {
+    let child_name = doc.node_name(child).unwrap_or("");
+    if child_name == decl.name {
+        return decl;
+    }
+    schema
+        .elements
+        .get(child_name)
+        .or_else(|| find_root_element_in_imports(child_name, schema))
+        .unwrap_or(decl)
+}
+
 /// Strict sequence validation: uses strict any-wildcard validation.
 fn validate_sequence_strict(
     doc: &Document,
     children: &[NodeId],
     particles: &[XsdParticle],
     parent_name: &str,
+    owner_ns: &str,
     schema: &XsdSchema,
     errors: &mut Vec<ValidationError>,
-) {
+    report_unexpected: bool,
+) -> usize {
     let mut idx = 0;
     for particle in particles {
         if idx >= children.len() {
@@ -2098,7 +2350,8 @@ fn validate_sequence_strict(
                     }
                 }
                 if element_matches_decl(doc, children[idx], decl, schema) {
-                    validate_element_strict(doc, children[idx], decl, schema, errors);
+                    let effective = resolve_substitution_member_decl(doc, children[idx], decl, schema);
+                    validate_element_strict(doc, children[idx], effective, schema, errors);
                     idx += 1;
                     // Handle additional occurrences (maxOccurs > 1)
                     if let MaxOccurs::Bounded(max) = decl.max_occurs {
@@ -2108,7 +2361,9 @@ fn validate_sequence_strict(
                             {
                                 break;
                             }
-                            validate_element_strict(doc, children[idx], decl, schema, errors);
+                            let effective =
+                                resolve_substitution_member_decl(doc, children[idx], decl, schema);
+                            validate_element_strict(doc, children[idx], effective, schema, errors);
                             idx += 1;
                         }
                     } else {
@@ -2116,7 +2371,9 @@ fn validate_sequence_strict(
                         while idx < children.len()
                             && element_matches_decl(doc, children[idx], decl, schema)
                         {
-                            validate_element_strict(doc, children[idx], decl, schema, errors);
+                            let effective =
+                                resolve_substitution_member_decl(doc, children[idx], decl, schema);
+                            validate_element_strict(doc, children[idx], effective, schema, errors);
                             idx += 1;
                         }
                     }
@@ -2136,6 +2393,7 @@ fn validate_sequence_strict(
                     &children[idx..],
                     content,
                     parent_name,
+                    owner_ns,
                     schema,
                     errors,
                 );
@@ -2147,6 +2405,7 @@ fn validate_sequence_strict(
                     &children[idx..],
                     any,
                     parent_name,
+                    owner_ns,
                     schema,
                     errors,
                 );
@@ -2155,14 +2414,17 @@ fn validate_sequence_strict(
         }
     }
     // Report any remaining unconsumed children as unexpected
-    while idx < children.len() {
-        let unexpected = doc.node_name(children[idx]).unwrap_or("<unknown>");
-        errors.push(ValidationError {
-            message: format!("unexpected element <{unexpected}> in <{parent_name}>; not expected by the content model"),
-            line: None, column: None,
-        });
-        idx += 1;
+    if report_unexpected {
+        while idx < children.len() {
+            let unexpected = doc.node_name(children[idx]).unwrap_or("<unknown>");
+            errors.push(ValidationError {
+                message: format!("unexpected element <{unexpected}> in <{parent_name}>; not expected by the content model"),
+                line: None, column: None,
+            });
+            idx += 1;
+        }
     }
+    idx
 }
 
 /// Strict group content validation.
@@ -2171,14 +2433,21 @@ fn validate_group_content_strict(
     children: &[NodeId],
     content: &ComplexContent,
     parent_name: &str,
+    owner_ns: &str,
     schema: &XsdSchema,
     errors: &mut Vec<ValidationError>,
 ) -> usize {
     match content {
-        ComplexContent::Sequence(particles) => {
-            validate_sequence_strict(doc, children, particles, parent_name, schema, errors);
-            children.len()
-        }
+        ComplexContent::Sequence(particles) => validate_sequence_strict(
+            doc,
+            children,
+            particles,
+            parent_name,
+            owner_ns,
+            schema,
+            errors,
+            false,
+        ),
         ComplexContent::Choice(particles) => {
             validate_choice(doc, children, particles, parent_name, schema, errors);
             children.len()
@@ -2201,10 +2470,15 @@ fn validate_any_wildcard_strict(
     children: &[NodeId],
     any: &XsdAny,
     parent_name: &str,
+    owner_ns: &str,
     schema: &XsdSchema,
     errors: &mut Vec<ValidationError>,
 ) -> usize {
-    let target_ns = schema.target_namespace.as_deref().unwrap_or("");
+    let target_ns = if owner_ns.is_empty() {
+        schema.target_namespace.as_deref().unwrap_or("")
+    } else {
+        owner_ns
+    };
     let mut count: usize = 0;
 
     for &child in children {
@@ -2354,8 +2628,15 @@ fn resolve_type_name<'a>(type_name: &str, schema: &'a XsdSchema) -> Option<&'a X
         }
     }
     // Last resort: try local name without namespace
-    if schema.types.get(&local).is_some() {
-        return schema.types.get(&local);
+    if let Some(t) = schema.types.get(&local) {
+        return Some(t);
+    }
+    // Fallback for prefixed names where the prefix is not present in root
+    // prefix_map: scan imported namespaces by local type name.
+    for imported in schema.imported_namespaces.values() {
+        if let Some(t) = imported.types.get(&local) {
+            return Some(t);
+        }
     }
     None
 }
@@ -2364,9 +2645,17 @@ fn resolve_type_name<'a>(type_name: &str, schema: &'a XsdSchema) -> Option<&'a X
 ///
 /// Checks local elements first, then imported namespaces for prefixed refs.
 fn resolve_element_ref<'a>(ref_qname: &str, schema: &'a XsdSchema) -> Option<&'a XsdElement> {
-    // Unprefixed ref — look up in local elements
+    // Unprefixed ref — look up in local elements first, then imported schemas.
     if !ref_qname.contains(':') {
-        return schema.elements.get(ref_qname);
+        if let Some(decl) = schema.elements.get(ref_qname) {
+            return Some(decl);
+        }
+        for imported in schema.imported_namespaces.values() {
+            if let Some(decl) = imported.elements.get(ref_qname) {
+                return Some(decl);
+            }
+        }
+        return None;
     }
     // Prefixed ref — resolve namespace and look up
     let (ns, local) = resolve_type_qname(ref_qname, &schema.prefix_map);
@@ -2671,7 +2960,7 @@ fn element_matches_decl(
 
 /// Resolves the namespace URI for an element referenced by QName.
 fn resolve_element_namespace(ref_qname: &str, schema: &XsdSchema) -> Option<String> {
-    let (ns_prefix, _local) = if let Some((p, l)) = ref_qname.split_once(':') {
+    let (ns_prefix, local) = if let Some((p, l)) = ref_qname.split_once(':') {
         (p, l)
     } else {
         return schema.target_namespace.clone();
@@ -2680,10 +2969,18 @@ fn resolve_element_namespace(ref_qname: &str, schema: &XsdSchema) -> Option<Stri
     if let Some(ns_uri) = schema.prefix_map.get(ns_prefix) {
         return Some(ns_uri.clone());
     }
-    // Check imported schemas' prefix maps
+    // Fallback: check prefix maps of imported schemas (includes that
+    // declare xmlns bindings not present in the root schema document).
     for imported in schema.imported_namespaces.values() {
-        // The namespace key itself tells us the URI
-        // Check if the prefix maps to this namespace
+        if let Some(ns_uri) = imported.prefix_map.get(ns_prefix) {
+            return Some(ns_uri.clone());
+        }
+    }
+    // Last resort: infer namespace from imported schemas that declare the element.
+    for (ns_uri, imported) in &schema.imported_namespaces {
+        if imported.elements.contains_key(local) {
+            return Some(ns_uri.clone());
+        }
     }
     schema.target_namespace.clone()
 }
@@ -2744,7 +3041,12 @@ fn validate_sequence_element(
         // own type for correct content validation.
         let child_name = doc.node_name(child).unwrap_or("");
         let effective_decl = if child_name != decl.name {
-            schema.elements.get(child_name).map(|d| d as &XsdElement).unwrap_or(decl)
+            schema
+                .elements
+                .get(child_name)
+                .map(|d| d as &XsdElement)
+                .or_else(|| find_root_element_in_imports(child_name, schema))
+                .unwrap_or(decl)
         } else {
             decl
         };
