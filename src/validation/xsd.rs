@@ -2150,7 +2150,7 @@ pub fn validate_xsd_strict(doc: &Document, schema: &XsdSchema) -> ValidationResu
 }
 
 /// Strict element validation: validates content and reports unknown attributes.
-fn validate_element_strict(
+pub fn validate_element_strict(
     doc: &Document,
     node: NodeId,
     decl: &XsdElement,
@@ -2364,61 +2364,76 @@ fn validate_sequence_strict(
     report_unexpected: bool,
 ) -> usize {
     let mut idx = 0;
-    for particle in particles {
-        if idx >= children.len() {
-            break;
-        }
-        match particle {
+    let mut pidx = 0;
+
+    while idx < children.len() && pidx < particles.len() {
+        match &particles[pidx] {
             XsdParticle::Element(decl) => {
-                // Skip optional elements that don't match
-                if decl.min_occurs == 0 && idx < children.len() {
-                    let child = children[idx];
-                    if !element_matches_decl(doc, child, decl, schema)
-                        && !matches_later_particle(doc, child, &particles[idx..], schema)
-                    {
-                        continue;
-                    }
-                }
                 if element_matches_decl(doc, children[idx], decl, schema) {
                     let effective =
                         resolve_substitution_member_decl(doc, children[idx], decl, schema);
                     validate_element_strict(doc, children[idx], effective, schema, errors);
                     idx += 1;
-                    // Handle additional occurrences (maxOccurs > 1)
-                    if let MaxOccurs::Bounded(max) = decl.max_occurs {
-                        for _ in 1..max {
-                            if idx >= children.len()
-                                || !element_matches_decl(doc, children[idx], decl, schema)
-                            {
-                                break;
+                    handle_repeat_occurrences_strict(
+                        doc, children, &mut idx, decl, schema, errors,
+                    );
+                    pidx += 1;
+                } else {
+                    let child = children[idx];
+                    if let Some(later_offset) =
+                        find_later_match(doc, child, &particles[pidx + 1..], schema)
+                    {
+                        let target_pidx = pidx + 1 + later_offset;
+                        let mut can_skip = true;
+                        for sp in pidx..target_pidx {
+                            if let XsdParticle::Element(sd) = &particles[sp] {
+                                if sd.min_occurs > 0 {
+                                    can_skip = false;
+                                    break;
+                                }
                             }
-                            let effective =
-                                resolve_substitution_member_decl(doc, children[idx], decl, schema);
-                            validate_element_strict(doc, children[idx], effective, schema, errors);
+                        }
+                        if can_skip {
+                            pidx = target_pidx;
+                        } else {
+                            let child_name = doc.node_name(child).unwrap_or("<unknown>");
+                            errors.push(ValidationError {
+                                message: format!(
+                                    "cvc-complex-type.2.4.a: element <{child_name}> was found beginning at <{parent_name}>, \"{expected}\" is expected",
+                                    expected = describe_expected_sequence_strict(
+                                        particles, pidx, schema,
+                                    ),
+                                ),
+                                line: None,
+                                column: None,
+                            });
                             idx += 1;
                         }
+                    } else if report_unexpected {
+                        if decl.min_occurs > 0 {
+                            errors.push(ValidationError {
+                                message: format!(
+                                    "element <{}> requires at least {} occurrence(s) of <{}>, found 0",
+                                    parent_name,
+                                    decl.min_occurs,
+                                    decl.element_ref.as_deref().unwrap_or(&decl.name)
+                                ),
+                                line: None,
+                                column: None,
+                            });
+                        }
+                        let child_name = doc.node_name(child).unwrap_or("<unknown>");
+                        errors.push(ValidationError {
+                            message: format!(
+                                "unexpected element <{child_name}> in <{parent_name}>; not expected by the content model"
+                            ),
+                            line: None,
+                            column: None,
+                        });
+                        idx += 1;
                     } else {
-                        // Unbounded
-                        while idx < children.len()
-                            && element_matches_decl(doc, children[idx], decl, schema)
-                        {
-                            let effective =
-                                resolve_substitution_member_decl(doc, children[idx], decl, schema);
-                            validate_element_strict(doc, children[idx], effective, schema, errors);
-                            idx += 1;
-                        }
+                        break;
                     }
-                } else if decl.min_occurs > 0 {
-                    errors.push(ValidationError {
-                        message: format!(
-                            "element <{}> requires at least {} occurrence(s) of <{}>, found 0",
-                            parent_name,
-                            decl.min_occurs,
-                            decl.element_ref.as_deref().unwrap_or(&decl.name)
-                        ),
-                        line: None,
-                        column: None,
-                    });
                 }
             }
             XsdParticle::Group(content) => {
@@ -2432,6 +2447,7 @@ fn validate_sequence_strict(
                     errors,
                 );
                 idx += consumed;
+                pidx += 1;
             }
             XsdParticle::Any(any) => {
                 let consumed = validate_any_wildcard_strict(
@@ -2444,16 +2460,18 @@ fn validate_sequence_strict(
                     errors,
                 );
                 idx += consumed;
+                pidx += 1;
             }
         }
     }
-    // Report any remaining unconsumed children as unexpected
+
     if report_unexpected {
         while idx < children.len() {
             let unexpected = doc.node_name(children[idx]).unwrap_or("<unknown>");
             errors.push(ValidationError {
                 message: format!("unexpected element <{unexpected}> in <{parent_name}>; not expected by the content model"),
-                line: None, column: None,
+                line: None,
+                column: None,
             });
             idx += 1;
         }
@@ -2461,7 +2479,6 @@ fn validate_sequence_strict(
     idx
 }
 
-/// Strict group content validation.
 fn validate_group_content_strict(
     doc: &Document,
     children: &[NodeId],
@@ -2846,6 +2863,104 @@ fn validate_sequence(
             line: None, column: None,
         });
     }
+}
+
+/// Consumes additional occurrences of a sequence element when maxOccurs > 1.
+fn handle_repeat_occurrences_strict(
+    doc: &Document,
+    children: &[NodeId],
+    idx: &mut usize,
+    decl: &XsdElement,
+    schema: &XsdSchema,
+    errors: &mut Vec<ValidationError>,
+) {
+    if let MaxOccurs::Bounded(max) = decl.max_occurs {
+        for _ in 1..max {
+            if *idx >= children.len()
+                || !element_matches_decl(doc, children[*idx], decl, schema)
+            {
+                break;
+            }
+            let effective =
+                resolve_substitution_member_decl(doc, children[*idx], decl, schema);
+            validate_element_strict(doc, children[*idx], effective, schema, errors);
+            *idx += 1;
+        }
+    } else {
+        while *idx < children.len()
+            && element_matches_decl(doc, children[*idx], decl, schema)
+        {
+            let effective =
+                resolve_substitution_member_decl(doc, children[*idx], decl, schema);
+            validate_element_strict(doc, children[*idx], effective, schema, errors);
+            *idx += 1;
+        }
+    }
+}
+
+/// Returns the index of the first particle in `later_particles` that matches
+/// `child`, or `None` if no later particle matches.
+fn find_later_match(
+    doc: &Document,
+    child: NodeId,
+    later_particles: &[XsdParticle],
+    schema: &XsdSchema,
+) -> Option<usize> {
+    for (i, particle) in later_particles.iter().enumerate() {
+        match particle {
+            XsdParticle::Element(decl) => {
+                if element_matches_decl(doc, child, decl, schema) {
+                    return Some(i);
+                }
+            }
+            XsdParticle::Group(content) => {
+                if matches_later_group(doc, child, content, schema) {
+                    return Some(i);
+                }
+            }
+            XsdParticle::Any(_) => {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// Builds a human-readable description of expected elements at a given
+/// sequence position, used in cvc-complex-type.2.4.a error messages.
+fn describe_expected_sequence_strict(
+    particles: &[XsdParticle],
+    from_idx: usize,
+    _schema: &XsdSchema,
+) -> String {
+    let mut names = Vec::new();
+    for p in particles.iter().skip(from_idx).take(8) {
+        match p {
+            XsdParticle::Element(decl) => {
+                let n = decl.element_ref.as_deref().unwrap_or(&decl.name);
+                if names.len() >= 6 {
+                    names.push("...".to_string());
+                    break;
+                }
+                names.push(n.to_string());
+            }
+            XsdParticle::Group(_) => {
+                if names.len() >= 6 {
+                    names.push("...".to_string());
+                    break;
+                }
+                names.push("(group)".to_string());
+            }
+            XsdParticle::Any(_) => {
+                if names.len() >= 6 {
+                    names.push("...".to_string());
+                    break;
+                }
+                names.push("(any)".to_string());
+            }
+        }
+    }
+    names.join(", ")
 }
 
 /// Checks if a child element matches any particle in later positions of a sequence.
