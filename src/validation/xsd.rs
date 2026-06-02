@@ -2188,6 +2188,35 @@ pub fn validate_element_strict(
     }
 }
 
+/// Deep validation fallback: when an element has no resolved type (e.g.
+/// `wfs:member` from an external namespace), validate each of its children
+/// by looking them up as global element declarations in the schema.
+/// This enables validation of AAA feature elements nested inside WFS/GML
+/// wrapper elements whose types are unknown to the AAA schema.
+fn validate_children_by_schema_lookup(
+    doc: &Document,
+    node: NodeId,
+    schema: &XsdSchema,
+    errors: &mut Vec<ValidationError>,
+) {
+    let ce = collect_child_elements(doc, node);
+    for child in ce {
+        let child_name = doc.node_name(child).unwrap_or("");
+        // Only attempt lookup for elements in the schema's target namespace
+        // or elements with no namespace (unqualified).
+        let child_ns = doc.node_namespace(child).unwrap_or("");
+        let in_schema_ns = schema.target_namespace.as_deref() == Some(child_ns)
+            || child_ns.is_empty();
+        if !in_schema_ns {
+            continue;
+        }
+        // Look up as global element declaration
+        if let Some(child_decl) = schema.elements.get(child_name) {
+            validate_element_strict(doc, child, child_decl, schema, errors);
+        }
+    }
+}
+
 fn resolve_simple_content_base_attributes(
     base_type: &str,
     schema: &XsdSchema,
@@ -2373,6 +2402,12 @@ fn validate_sequence_strict(
                     let effective =
                         resolve_substitution_member_decl(doc, children[idx], decl, schema);
                     validate_element_strict(doc, children[idx], effective, schema, errors);
+                    // Deep validation: if the element has no declared type
+                    // (e.g. wfs:member), validate its children against schema
+                    // declarations that match by local name.
+                    validate_children_by_schema_lookup(
+                        doc, children[idx], schema, errors,
+                    );
                     idx += 1;
                     handle_repeat_occurrences_strict(
                         doc, children, &mut idx, decl, schema, errors,
